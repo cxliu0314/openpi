@@ -1,7 +1,9 @@
 from collections.abc import Iterator, Sequence
+import hashlib
 import logging
 import multiprocessing
 import os
+import re
 import typing
 from typing import Literal, Protocol, SupportsIndex, TypeVar
 
@@ -12,6 +14,7 @@ import numpy as np
 import torch
 
 import openpi.models.model as _model
+import openpi.shared.array_typing as at
 import openpi.training.config as _config
 from openpi.training.droid_rlds_dataset import DroidRldsDataset
 import openpi.transforms as _transforms
@@ -60,6 +63,23 @@ class TransformedDataset(Dataset[T_co]):
 
     def __len__(self) -> int:
         return len(self._dataset)
+
+
+class InjectEpisodeLenFromEpisodeIndex(_transforms.DataTransformFn):
+    def __init__(self, episode_lengths: np.ndarray):
+        self._episode_lengths = np.asarray(episode_lengths, dtype=np.int32)
+
+    def __call__(self, data: dict) -> dict:
+        if "episode_len" in data or "episode_index" not in data:
+            return data
+
+        episode_index = int(np.asarray(data["episode_index"]).item())
+        if episode_index < 0 or episode_index >= self._episode_lengths.shape[0]:
+            return data
+
+        data = dict(data)
+        data["episode_len"] = np.asarray(self._episode_lengths[episode_index], dtype=np.int32)
+        return data
 
 
 class IterableTransformedDataset(IterableDataset[T_co]):
@@ -145,6 +165,14 @@ def create_torch_dataset(
         },
     )
 
+    if hasattr(dataset, "episode_data_index"):
+        episode_data_index = dataset.episode_data_index
+        if isinstance(episode_data_index, dict) and "from" in episode_data_index and "to" in episode_data_index:
+            episode_from = np.asarray(episode_data_index["from"], dtype=np.int64)
+            episode_to = np.asarray(episode_data_index["to"], dtype=np.int64)
+            episode_lengths = np.maximum(episode_to - episode_from, 1).astype(np.int32)
+            dataset = TransformedDataset(dataset, [InjectEpisodeLenFromEpisodeIndex(episode_lengths)])
+
     if data_config.prompt_from_task:
         dataset = TransformedDataset(dataset, [_transforms.PromptFromLeRobotTask(dataset_meta.tasks)])
 
@@ -228,7 +256,7 @@ def create_data_loader(
     num_batches: int | None = None,
     skip_norm_stats: bool = False,
     framework: Literal["jax", "pytorch"] = "jax",
-) -> DataLoader[tuple[_model.Observation, _model.Actions]]:
+) -> DataLoader[tuple[_model.Observation, _model.Actions, at.Array, at.Array]]:
     """Create a data loader for training.
 
     Args:
@@ -241,6 +269,10 @@ def create_data_loader(
     """
     data_config = config.data.create(config.assets_dirs, config.model)
     logging.info(f"data_config: {data_config}")
+    require_accurate_progress = bool(config.enable_progress_loss and getattr(config.model, "enable_progress_head", False))
+    progress_target_mode = config.progress_target_mode
+    sample_debug_interval = config.log_interval if shuffle else 0
+    debug_name = "train" if shuffle else "eval"
 
     if data_config.rlds_data_dir is not None:
         return create_rlds_data_loader(
@@ -252,6 +284,10 @@ def create_data_loader(
             num_batches=num_batches,
             skip_norm_stats=skip_norm_stats,
             framework=framework,
+            require_accurate_progress=require_accurate_progress,
+            progress_target_mode=progress_target_mode,
+            sample_debug_interval=sample_debug_interval,
+            debug_name=debug_name,
         )
     return create_torch_data_loader(
         data_config,
@@ -265,6 +301,10 @@ def create_data_loader(
         seed=config.seed,
         skip_norm_stats=skip_norm_stats,
         framework=framework,
+        require_accurate_progress=require_accurate_progress,
+        progress_target_mode=progress_target_mode,
+        sample_debug_interval=sample_debug_interval,
+        debug_name=debug_name,
     )
 
 
@@ -281,7 +321,11 @@ def create_torch_data_loader(
     num_workers: int = 0,
     seed: int = 0,
     framework: str = "jax",
-) -> DataLoader[tuple[_model.Observation, _model.Actions]]:
+    require_accurate_progress: bool = False,
+    progress_target_mode: Literal["scalar", "chunk"] = "scalar",
+    sample_debug_interval: int = 0,
+    debug_name: str = "loader",
+) -> DataLoader[tuple[_model.Observation, _model.Actions, at.Array, at.Array]]:
     """Create a data loader for training.
 
     Args:
@@ -332,9 +376,16 @@ def create_torch_data_loader(
         num_workers=num_workers,
         seed=seed,
         framework=framework,
+        require_accurate_progress=require_accurate_progress,
+        progress_target_mode=progress_target_mode,
     )
 
-    return DataLoaderImpl(data_config, data_loader)
+    return DataLoaderImpl(
+        data_config,
+        data_loader,
+        debug_name=debug_name,
+        sample_debug_interval=sample_debug_interval,
+    )
 
 
 def create_rlds_data_loader(
@@ -347,7 +398,11 @@ def create_rlds_data_loader(
     shuffle: bool = False,
     num_batches: int | None = None,
     framework: str = "jax",
-) -> DataLoader[tuple[_model.Observation, _model.Actions]]:
+    require_accurate_progress: bool = False,
+    progress_target_mode: Literal["scalar", "chunk"] = "scalar",
+    sample_debug_interval: int = 0,
+    debug_name: str = "loader",
+) -> DataLoader[tuple[_model.Observation, _model.Actions, at.Array, at.Array]]:
     """Create an RLDS data loader for training.
 
     Note: This data loader requires some extra dependencies -- see examples/droid/README_train.md
@@ -373,9 +428,16 @@ def create_rlds_data_loader(
         dataset,
         sharding=sharding,
         num_batches=num_batches,
+        require_accurate_progress=require_accurate_progress,
+        progress_target_mode=progress_target_mode,
     )
 
-    return DataLoaderImpl(data_config, data_loader)
+    return DataLoaderImpl(
+        data_config,
+        data_loader,
+        debug_name=debug_name,
+        sample_debug_interval=sample_debug_interval,
+    )
 
 
 class TorchDataLoader:
@@ -393,6 +455,8 @@ class TorchDataLoader:
         num_workers: int = 0,
         seed: int = 0,
         framework: str = "jax",
+        require_accurate_progress: bool = False,
+        progress_target_mode: Literal["scalar", "chunk"] = "scalar",
     ):
         """Create a PyTorch data loader.
 
@@ -424,6 +488,8 @@ class TorchDataLoader:
                 jax.sharding.PartitionSpec("B"),
             )
         self._num_batches = num_batches
+        self._require_accurate_progress = require_accurate_progress
+        self._progress_target_mode = progress_target_mode
 
         mp_context = None
         if num_workers > 0:
@@ -461,6 +527,14 @@ class TorchDataLoader:
                 except StopIteration:
                     break  # We've exhausted the dataset. Create a new iterator and start over.
                 num_items += 1
+                batch = _pad_actions_to_episode_end(batch, progress_target_mode=self._progress_target_mode)
+                progress_target, episode_hash = _compute_progress_and_episode_hash(
+                    batch,
+                    require_accurate_progress=self._require_accurate_progress,
+                    progress_target_mode=self._progress_target_mode,
+                )
+                batch["progress_target"] = progress_target
+                batch["episode_hash"] = episode_hash
                 # For JAX, convert to sharded arrays; for PyTorch, return torch tensors
                 if self._sharding is not None:
                     yield jax.tree.map(lambda x: jax.make_array_from_process_local_data(self._sharding, x), batch)
@@ -495,6 +569,8 @@ class RLDSDataLoader:
         *,
         sharding: jax.sharding.Sharding | None = None,
         num_batches: int | None = None,
+        require_accurate_progress: bool = False,
+        progress_target_mode: Literal["scalar", "chunk"] = "scalar",
     ):
         self._dataset = dataset
         self._num_batches = num_batches
@@ -511,6 +587,8 @@ class RLDSDataLoader:
 
         self._sharding = sharding
         self._num_batches = num_batches
+        self._require_accurate_progress = require_accurate_progress
+        self._progress_target_mode = progress_target_mode
 
     def __iter__(self):
         num_items = 0
@@ -524,17 +602,323 @@ class RLDSDataLoader:
                 except StopIteration:
                     break  # We've exhausted the dataset. Create a new iterator and start over.
                 num_items += 1
+                batch = _pad_actions_to_episode_end(batch, progress_target_mode=self._progress_target_mode)
+                progress_target, episode_hash = _compute_progress_and_episode_hash(
+                    batch,
+                    require_accurate_progress=self._require_accurate_progress,
+                    progress_target_mode=self._progress_target_mode,
+                )
+                batch["progress_target"] = progress_target
+                batch["episode_hash"] = episode_hash
                 yield jax.tree.map(lambda x: jax.make_array_from_process_local_data(self._sharding, x), batch)
 
 
 class DataLoaderImpl(DataLoader):
-    def __init__(self, data_config: _config.DataConfig, data_loader: TorchDataLoader | RLDSDataLoader):
+    def __init__(
+        self,
+        data_config: _config.DataConfig,
+        data_loader: TorchDataLoader | RLDSDataLoader,
+        *,
+        debug_name: str = "loader",
+        sample_debug_interval: int = 0,
+    ):
         self._data_config = data_config
         self._data_loader = data_loader
+        self._debug_name = debug_name
+        self._sample_debug_interval = sample_debug_interval
+        self._yield_count = 0
 
     def data_config(self) -> _config.DataConfig:
         return self._data_config
 
     def __iter__(self):
         for batch in self._data_loader:
-            yield _model.Observation.from_dict(batch), batch["actions"]
+            progress_target = batch.pop("progress_target")
+            episode_hash = batch.pop("episode_hash")
+            if self._sample_debug_interval > 0 and self._yield_count % self._sample_debug_interval == 0:
+                logging.info(
+                    "batch_sample[%s:%d]\n%s",
+                    self._debug_name,
+                    self._yield_count,
+                    _format_batch_sample_for_logging(batch, progress_target, episode_hash),
+                )
+            self._yield_count += 1
+            yield _model.Observation.from_dict(batch), batch["actions"], progress_target, episode_hash
+
+
+_STEP_ID_SUFFIX_RE = re.compile(r"^(.*)--(\d+)$")
+_PROGRESS_DEBUG_MAX_PRINTS = 8
+_progress_debug_print_count = 0
+_BATCH_SAMPLE_ACTION_STEPS = 3
+_BATCH_SAMPLE_ACTION_DIMS = 6
+_BATCH_SAMPLE_STATE_DIMS = 8
+_BATCH_SAMPLE_TOKEN_IDS = 24
+_BATCH_SAMPLE_TEXT_CHARS = 160
+
+
+def _to_numpy(value) -> np.ndarray:
+    if isinstance(value, torch.Tensor):
+        return value.detach().cpu().numpy()
+    return np.asarray(jax.device_get(value))
+
+
+def _preview_numeric(
+    value: np.ndarray | torch.Tensor | jax.Array,
+    *,
+    max_rows: int = 1,
+    max_cols: int = 8,
+    precision: int = 4,
+) -> str:
+    arr = _to_numpy(value)
+    if arr.ndim == 0:
+        return f"{float(arr):.{precision}f}"
+    if arr.ndim == 1:
+        preview = arr[:max_cols]
+    else:
+        preview = arr[:max_rows, :max_cols]
+    return np.array2string(preview, precision=precision, suppress_small=False)
+
+
+def _preview_text(values: np.ndarray | torch.Tensor | jax.Array, *, max_chars: int = _BATCH_SAMPLE_TEXT_CHARS) -> str:
+    text = _decode_text_array(_to_numpy(values))[0]
+    text = text.replace("\n", " ")
+    if len(text) > max_chars:
+        return text[: max_chars - 3] + "..."
+    return text
+
+
+def _format_batch_sample_for_logging(
+    batch: dict[str, np.ndarray], progress_target: np.ndarray, episode_hash: np.ndarray, *, sample_index: int = 0
+) -> str:
+    lines: list[str] = []
+    actions = _to_numpy(batch["actions"])
+    progress_target_np = _to_numpy(progress_target)
+    episode_hash_np = _to_numpy(episode_hash).reshape(-1)
+
+    lines.append(f"episode_hash={int(episode_hash_np[sample_index])}")
+    lines.append(f"actions_shape={tuple(actions.shape)}")
+
+    if "step_id" in batch:
+        lines.append(f"step_id={_preview_text(_to_numpy(batch['step_id'])[sample_index:sample_index + 1])}")
+    if "episode_index" in batch:
+        lines.append(f"episode_index={int(_to_numpy(batch['episode_index']).reshape(-1)[sample_index])}")
+    if "task_index" in batch:
+        lines.append(f"task_index={int(_to_numpy(batch['task_index']).reshape(-1)[sample_index])}")
+    if "frame_index" in batch:
+        lines.append(f"frame_index={float(_to_numpy(batch['frame_index']).reshape(-1)[sample_index]):.1f}")
+    if "episode_len" in batch:
+        lines.append(f"episode_len={float(_to_numpy(batch['episode_len']).reshape(-1)[sample_index]):.1f}")
+    if "prompt" in batch:
+        lines.append(f"prompt={_preview_text(_to_numpy(batch['prompt'])[sample_index:sample_index + 1])}")
+
+    if "state" in batch:
+        state_np = _to_numpy(batch["state"])
+        lines.append(
+            "state[:8]="
+            + np.array2string(
+                state_np[sample_index, : min(_BATCH_SAMPLE_STATE_DIMS, state_np.shape[-1])],
+                precision=4,
+                suppress_small=False,
+            )
+        )
+
+    if "tokenized_prompt" in batch:
+        tokenized_prompt = _to_numpy(batch["tokenized_prompt"])
+        prompt_mask = _to_numpy(batch.get("tokenized_prompt_mask")) if "tokenized_prompt_mask" in batch else None
+        token_count = int(prompt_mask[sample_index].sum()) if prompt_mask is not None else int(tokenized_prompt.shape[-1])
+        token_preview = tokenized_prompt[sample_index, : min(_BATCH_SAMPLE_TOKEN_IDS, tokenized_prompt.shape[-1])]
+        lines.append(
+            f"tokenized_prompt_valid={token_count}, tokenized_prompt[:{len(token_preview)}]="
+            + np.array2string(token_preview, separator=", ")
+        )
+
+    action_preview = actions[
+        sample_index,
+        : min(_BATCH_SAMPLE_ACTION_STEPS, actions.shape[1]),
+        : min(_BATCH_SAMPLE_ACTION_DIMS, actions.shape[2]),
+    ]
+    lines.append(
+        f"actions[:{action_preview.shape[0]}, :{action_preview.shape[1]}]="
+        + _preview_numeric(action_preview, max_rows=action_preview.shape[0], max_cols=action_preview.shape[1])
+    )
+
+    if progress_target_np.ndim == 1:
+        lines.append(f"progress_target={float(progress_target_np[sample_index]):.4f}")
+    else:
+        progress_preview = progress_target_np[sample_index]
+        lines.append(
+            f"progress_target[:{progress_preview.shape[0]}]="
+            + np.array2string(progress_preview, precision=4, suppress_small=False)
+        )
+
+    if "frame_index" in batch and "episode_len" in batch:
+        frame_index = float(_to_numpy(batch["frame_index"]).reshape(-1)[sample_index])
+        episode_len = float(_to_numpy(batch["episode_len"]).reshape(-1)[sample_index])
+        denom = max(episode_len - 1.0, 1.0)
+        if progress_target_np.ndim == 1:
+            expected_progress = np.clip(frame_index / denom, 0.0, 1.0).astype(np.float32)
+            progress_err = abs(float(progress_target_np[sample_index]) - float(expected_progress))
+        else:
+            offsets = np.arange(progress_target_np.shape[1], dtype=np.float32)
+            expected_progress = np.clip((frame_index + offsets) / denom, 0.0, 1.0).astype(np.float32)
+            progress_err = float(np.max(np.abs(progress_target_np[sample_index] - expected_progress)))
+        lines.append(f"progress_formula_max_err={progress_err:.6f}")
+
+        last_valid_offset = int(np.clip(episode_len - 1.0 - frame_index, 0, actions.shape[1] - 1))
+        tail_starts = last_valid_offset + 1
+        if tail_starts < actions.shape[1]:
+            tail_matches = np.allclose(
+                actions[sample_index, tail_starts:],
+                actions[sample_index, last_valid_offset : last_valid_offset + 1],
+                atol=1e-6,
+            )
+            lines.append(
+                f"chunk_tail_padded=True, last_valid_offset={last_valid_offset}, tail_matches_last_valid={bool(tail_matches)}"
+            )
+        else:
+            lines.append(f"chunk_tail_padded=False, last_valid_offset={last_valid_offset}")
+
+    if "image" in batch:
+        image_masks = batch.get("image_mask", {})
+        for name, image in batch["image"].items():
+            image_np = _to_numpy(image)[sample_index]
+            mask_value = (
+                bool(_to_numpy(image_masks[name]).reshape(-1)[sample_index]) if name in image_masks else True
+            )
+            lines.append(
+                f"image[{name}]: mask={mask_value}, mean={float(image_np.mean()):.4f}, std={float(image_np.std()):.4f}, "
+                f"min={float(image_np.min()):.4f}, max={float(image_np.max()):.4f}"
+            )
+
+    return "\n".join(f"  {line}" for line in lines)
+
+
+def _stable_hash_int64(text: str) -> np.int64:
+    digest = hashlib.blake2b(text.encode("utf-8"), digest_size=8).digest()
+    return np.int64(int.from_bytes(digest, byteorder="little", signed=False) & ((1 << 63) - 1))
+
+
+def _decode_text_array(arr: np.ndarray) -> list[str]:
+    flat = arr.reshape(-1)
+    out = []
+    for value in flat:
+        if isinstance(value, bytes):
+            out.append(value.decode("utf-8"))
+        else:
+            out.append(str(value))
+    return out
+
+
+def _compute_progress_and_episode_hash(
+    batch: dict[str, np.ndarray],
+    *,
+    require_accurate_progress: bool = False,
+    progress_target_mode: Literal["scalar", "chunk"] = "scalar",
+) -> tuple[np.ndarray, np.ndarray]:
+    global _progress_debug_print_count
+
+    actions = np.asarray(batch["actions"])
+    batch_size = actions.shape[0]
+    action_horizon = actions.shape[1]
+
+    def _compute_progress_from_frame_index(frame_index: np.ndarray, episode_len: np.ndarray) -> np.ndarray:
+        denom = np.maximum(episode_len - 1.0, 1.0)
+        progress_base = frame_index / denom
+        return np.clip(progress_base.astype(np.float32), 0.0, 1.0)
+
+    def _compute_chunk_progress_from_frame_index(frame_index: np.ndarray, episode_len: np.ndarray) -> np.ndarray:
+        offsets = np.arange(action_horizon, dtype=np.float32)[None, :]
+        denom = np.maximum(episode_len - 1.0, 1.0)[:, None]
+        progress_base = (frame_index[:, None] + offsets) / denom
+        return np.clip(progress_base.astype(np.float32), 0.0, 1.0)
+
+    def _decode_step_metadata() -> tuple[np.ndarray, list[str]]:
+        step_ids = _decode_text_array(np.asarray(batch["step_id"]))
+        frame_index = np.zeros(batch_size, dtype=np.float32)
+        episode_keys: list[str] = []
+        for i, step_id in enumerate(step_ids):
+            match = _STEP_ID_SUFFIX_RE.match(step_id)
+            if match is None:
+                episode_keys.append(step_id)
+                frame_index[i] = 0.0
+            else:
+                episode_keys.append(match.group(1))
+                frame_index[i] = float(match.group(2))
+        return frame_index, episode_keys
+
+    if "frame_index" in batch and "episode_len" in batch:
+        frame_index = np.asarray(batch["frame_index"], dtype=np.float32).reshape(batch_size)
+        episode_len = np.asarray(batch["episode_len"], dtype=np.float32).reshape(batch_size)
+        if progress_target_mode == "chunk":
+            progress = _compute_chunk_progress_from_frame_index(frame_index, episode_len)
+        else:
+            progress = _compute_progress_from_frame_index(frame_index, episode_len)
+    else:
+        if require_accurate_progress:
+            keys = ", ".join(sorted(batch.keys()))
+            raise ValueError(
+                "Accurate progress supervision requires linear trajectory progress from "
+                "(`frame_index`, `episode_len`). "
+                f"Available batch keys: {keys}"
+            )
+        if progress_target_mode == "chunk":
+            progress = np.zeros((batch_size, action_horizon), dtype=np.float32)
+        else:
+            progress = np.zeros((batch_size,), dtype=np.float32)
+
+    progress = np.clip(progress.astype(np.float32), 0.0, 1.0)
+
+    if "episode_hash" in batch:
+        episode_hash = np.asarray(batch["episode_hash"], dtype=np.int64).reshape(batch_size)
+    elif "step_id" in batch:
+        _, episode_keys = _decode_step_metadata()
+        episode_hash = np.asarray([_stable_hash_int64(k) for k in episode_keys], dtype=np.int64)
+    elif "episode_index" in batch:
+        episode_hash = np.asarray(batch["episode_index"], dtype=np.int64).reshape(batch_size)
+    else:
+        if "prompt" in batch:
+            prompts = _decode_text_array(np.asarray(batch["prompt"]))
+            episode_hash = np.asarray([_stable_hash_int64(p) for p in prompts], dtype=np.int64)
+        else:
+            episode_hash = np.asarray([_stable_hash_int64(f"batch_local_{i}") for i in range(batch_size)], dtype=np.int64)
+
+    if _progress_debug_print_count < _PROGRESS_DEBUG_MAX_PRINTS and progress.shape[0] > 0:
+        key_list = sorted(batch.keys())
+        logging.info(
+            "progress_debug[%d]: keys=%s, progress_target_mode=%s, progress_shape=%s, sample0=%.4f, episode_hash0=%d",
+            _progress_debug_print_count,
+            key_list,
+            progress_target_mode,
+            tuple(progress.shape),
+            float(progress.reshape(-1)[0]),
+            int(np.asarray(episode_hash).reshape(-1)[0]),
+        )
+        _progress_debug_print_count += 1
+
+    return progress, episode_hash
+
+
+def _pad_actions_to_episode_end(
+    batch: dict[str, np.ndarray], *, progress_target_mode: Literal["scalar", "chunk"] = "scalar"
+) -> dict[str, np.ndarray]:
+    if progress_target_mode != "chunk":
+        return batch
+    if "frame_index" not in batch or "episode_len" not in batch:
+        return batch
+
+    actions = np.asarray(batch["actions"])
+    if actions.ndim < 3 or actions.shape[1] == 0:
+        return batch
+
+    frame_index = np.asarray(batch["frame_index"], dtype=np.float32).reshape(actions.shape[0])
+    episode_len = np.asarray(batch["episode_len"], dtype=np.float32).reshape(actions.shape[0])
+    last_valid_offset = np.clip((episode_len - 1.0 - frame_index).astype(np.int32), 0, actions.shape[1] - 1)
+    padded_actions = np.array(actions, copy=True)
+
+    for i, last_offset in enumerate(last_valid_offset):
+        if last_offset + 1 < padded_actions.shape[1]:
+            padded_actions[i, last_offset + 1 :] = padded_actions[i, last_offset]
+
+    batch = dict(batch)
+    batch["actions"] = padded_actions
+    return batch

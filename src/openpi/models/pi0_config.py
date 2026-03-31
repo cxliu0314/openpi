@@ -31,6 +31,7 @@ class Pi0Config(_model.BaseModelConfig):
     pi05: bool = False
     # This config option is not used directly by the model, but it is read by the ModelTransformFactory.
     discrete_state_input: bool = None  # type: ignore
+    enable_progress_head: bool | None = None
 
     pytorch_compile_mode: str | None = "max-autotune"
 
@@ -46,6 +47,8 @@ class Pi0Config(_model.BaseModelConfig):
                 "max-autotune",
                 "max-autotune-no-cudagraphs",
             ]
+        if self.enable_progress_head is None:
+            object.__setattr__(self, "enable_progress_head", self.pi05)
 
     @property
     @override

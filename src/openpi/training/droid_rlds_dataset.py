@@ -70,11 +70,12 @@ class DroidRldsDataset:
             )
 
             # Filter out any unsuccessful trajectories -- we use the file name to check this
-            dataset = dataset.filter(
-                lambda traj: tf.strings.regex_full_match(
-                    traj["traj_metadata"]["episode_metadata"]["file_path"][0], ".*success.*"
-                )
-            )
+            # NOTE: Commented out for local datasets that may not have "success" in file paths
+            # dataset = dataset.filter(
+            #     lambda traj: tf.strings.regex_full_match(
+            #         traj["traj_metadata"]["episode_metadata"]["file_path"][0], ".*success.*"
+            #     )
+            # )
 
             # Repeat dataset so we never run out of data.
             dataset = dataset.repeat()
@@ -140,7 +141,8 @@ class DroidRldsDataset:
                 )[0]
 
                 traj_len = tf.shape(traj["action"])[0]
-                indices = tf.as_string(tf.range(traj_len))
+                frame_index = tf.range(traj_len)
+                indices = tf.as_string(frame_index)
 
                 # Data filtering:
                 # Compute a uniquely-identifying step ID by concatenating the recording folderpath, file path,
@@ -165,6 +167,8 @@ class DroidRldsDataset:
                     },
                     "prompt": instruction,
                     "step_id": step_id,
+                    "frame_index": frame_index,
+                    "episode_len": tf.fill([traj_len], traj_len),
                     "passes_filter": passes_filter,
                 }
 

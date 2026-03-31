@@ -307,6 +307,9 @@ class LeRobotLiberoDataConfig(DataConfigFactory):
                         "observation/state": "state",
                         "actions": "actions",
                         "prompt": "prompt",
+                        "frame_index": "frame_index",
+                        "episode_index": "episode_index",
+                        "episode_len": "episode_len",
                     }
                 )
             ]
@@ -525,6 +528,36 @@ class TrainConfig:
     # If true, will enable wandb logging.
     wandb_enabled: bool = True
 
+    # If true, enables progress head supervision when the model provides progress predictions.
+    enable_progress_loss: bool = True
+    # Weight of progress loss term in total loss.
+    progress_loss_weight: float = 0.1
+    # Weight of the relative-progress loss term for current+relative readout modes.
+    progress_relative_loss_weight: float = 0.25
+    # Controls how progress supervision targets are constructed.
+    progress_target_mode: Literal["scalar", "chunk"] = "scalar"
+    # Controls which model interface is used to produce progress predictions.
+    progress_readout_mode: Literal[
+        "prefix",
+        "low_noise_action",
+        "chunk_prefix",
+        "chunk_prefix_large",
+        "chunk_low_noise_action",
+        "chunk_hybrid_concat",
+        "chunk_self_action",
+        "chunk_hybrid_self_action",
+        "chunk_hybrid_self_action_large",
+        "chunk_multilayer_self_action",
+        "chunk_current_relative_flat",
+        "chunk_current_relative_multilayer",
+    ] = "prefix"
+
+    # Validation options.
+    use_val_set: bool = True
+    val_split_ratio: float = 0.1
+    val_interval: int = 500
+    val_num_batches: int = 10
+
     # Used to pass metadata to the policy server.
     policy_metadata: dict[str, Any] | None = None
 
@@ -554,6 +587,32 @@ class TrainConfig:
     def __post_init__(self) -> None:
         if self.resume and self.overwrite:
             raise ValueError("Cannot resume and overwrite at the same time.")
+        if not (0.0 <= self.val_split_ratio < 1.0):
+            raise ValueError(f"val_split_ratio must be in [0, 1), got {self.val_split_ratio}")
+
+
+_DROID_SUBTASK_CONFIGS = {
+    "flip": {"steps": 5_000, "warmup": 500, "save_interval": 250, "keep_period": 1_000},
+    "grasp": {"steps": 19_342, "warmup": 1_934, "save_interval": 967, "keep_period": 5_000},
+    "hold": {"steps": 5_000, "warmup": 500, "save_interval": 250, "keep_period": 1_000},
+    "insert": {"steps": 5_000, "warmup": 500, "save_interval": 250, "keep_period": 1_000},
+    "move": {"steps": 18_468, "warmup": 1_847, "save_interval": 923, "keep_period": 5_000},
+    "press": {"steps": 5_000, "warmup": 500, "save_interval": 250, "keep_period": 1_000},
+    "pull": {"steps": 5_000, "warmup": 500, "save_interval": 250, "keep_period": 1_000},
+    "push": {"steps": 5_000, "warmup": 500, "save_interval": 250, "keep_period": 1_000},
+    "reach": {"steps": 20_000, "warmup": 2_000, "save_interval": 1_000, "keep_period": 5_000},
+    "release": {"steps": 12_080, "warmup": 1_208, "save_interval": 604, "keep_period": 3_000},
+    "rotate": {"steps": 5_000, "warmup": 500, "save_interval": 250, "keep_period": 1_000},
+}
+
+_LIBERO_SUBTASK_CONFIGS = {
+    "grasp": {"steps": 7_496, "warmup": 750, "save_interval": 375, "keep_period": 1_500},
+    "move": {"steps": 7_084, "warmup": 708, "save_interval": 354, "keep_period": 1_500},
+    "push": {"steps": 5_000, "warmup": 500, "save_interval": 250, "keep_period": 1_000},
+    "reach": {"steps": 7_404, "warmup": 740, "save_interval": 370, "keep_period": 1_500},
+    "release": {"steps": 6_772, "warmup": 677, "save_interval": 339, "keep_period": 1_500},
+    "rotate": {"steps": 5_000, "warmup": 500, "save_interval": 250, "keep_period": 1_000},
+}
 
 
 # Use `get_config` if you need to get a config by name in your code.
@@ -744,7 +803,7 @@ _CONFIGS = [
         name="pi05_libero",
         model=pi0_config.Pi0Config(pi05=True, action_horizon=10, discrete_state_input=False),
         data=LeRobotLiberoDataConfig(
-            repo_id="physical-intelligence/libero",
+            repo_id="modified_libero_lerobot_split_padded/libero_10_no_noops",
             base_config=DataConfig(prompt_from_task=True),
             extra_delta_transform=False,
         ),
@@ -757,8 +816,120 @@ _CONFIGS = [
         ),
         optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
         ema_decay=0.999,
-        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        weight_loader=weight_loaders.CheckpointWeightLoader("/data/Embobrain/modelsrepo/pi05_base/params"),
         pytorch_weight_path="/path/to/your/pytorch_weight_path",
+        num_train_steps=30_000,
+    ),
+    # π₀.₅ LIBERO LoRA fine-tuning
+    TrainConfig(
+        name="pi05_libero_lora",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=10,
+            discrete_state_input=False,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ),
+        data=LeRobotLiberoDataConfig(
+            repo_id="modified_libero_lerobot_split_padded/libero_10_no_noops",
+            base_config=DataConfig(prompt_from_task=True),
+            extra_delta_transform=False,
+        ),
+        batch_size=256,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=10_000,
+            peak_lr=5e-5,
+            decay_steps=1_000_000,
+            decay_lr=5e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        # Turn off EMA for LoRA finetuning.
+        ema_decay=None,
+        weight_loader=weight_loaders.CheckpointWeightLoader("/data/Embobrain/modelsrepo/pi05_base/params"),
+        freeze_filter=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=10,
+            discrete_state_input=False,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ).get_freeze_filter(),
+        num_train_steps=30_000,
+    ),
+    # pi0.5 LIBERO LoRA progress-head training base config (for progress-head-only script).
+    TrainConfig(
+        name="pi05_libero_lora_progress_head",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=10,
+            discrete_state_input=False,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ),
+        data=LeRobotLiberoDataConfig(
+            repo_id="modified_libero_lerobot_split_padded/libero_10_no_noops",
+            base_config=DataConfig(prompt_from_task=True),
+            extra_delta_transform=False,
+            assets=AssetsConfig(
+                assets_dir="/data/Embobrain/openpi/assets/pi05_libero_lora_from_droid",
+                asset_id="modified_libero_lerobot_split_padded/libero_10_no_noops",
+            ),
+        ),
+        batch_size=256,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=10_000,
+            peak_lr=5e-5,
+            decay_steps=1_000_000,
+            decay_lr=5e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=None,
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "/data/Embobrain/openpi/checkpoints/pi05_libero_lora/libero_lora_finetune/29999/params"
+        ),
+        freeze_filter=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=10,
+            discrete_state_input=False,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ).get_freeze_filter(),
+        num_train_steps=30_000,
+    ),
+    # pi0.5 LIBERO LoRA finetuning initialized from a DROID-finetuned checkpoint.
+    TrainConfig(
+        name="pi05_libero_lora_from_droid",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=10,
+            discrete_state_input=False,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ),
+        data=LeRobotLiberoDataConfig(
+            repo_id="modified_libero_lerobot_split_padded/libero_10_no_noops",
+            base_config=DataConfig(prompt_from_task=True),
+            extra_delta_transform=False,
+        ),
+        batch_size=256,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=10_000,
+            peak_lr=5e-5,
+            decay_steps=1_000_000,
+            decay_lr=5e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        # Turn off EMA for LoRA finetuning.
+        ema_decay=None,
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "/data/Embobrain/openpi/checkpoints/pi05_full_droid_finetune/droid_pi05_full_finetune_100k/99999/params"
+        ),
+        freeze_filter=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=10,
+            discrete_state_input=False,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ).get_freeze_filter(),
         num_train_steps=30_000,
     ),
     #
@@ -871,14 +1042,22 @@ _CONFIGS = [
         data=RLDSDroidDataConfig(
             repo_id="droid",
             # Set this to the path to your DROID RLDS dataset (the parent directory of the `droid` directory).
-            rlds_data_dir="/mnt/pi-data/kevin",
+            rlds_data_dir="/data/Embobrain/dataset/droid_rlds_split_padded",
             action_space=droid_rlds_dataset.DroidActionSpace.JOINT_POSITION,
+            datasets=(
+                droid_rlds_dataset.RLDSDataset(
+                    name="droid",
+                    version="0.0.1",
+                    weight=1.0,
+                    filter_dict_path=None,  # No filter for local dataset
+                ),
+            ),
             assets=AssetsConfig(
                 assets_dir="gs://openpi-assets/checkpoints/pi05_base/assets/",
                 asset_id="droid",
             ),
         ),
-        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        weight_loader=weight_loaders.CheckpointWeightLoader("/data/Embobrain/modelsrepo/pi05_base/params"),
         lr_schedule=_optimizer.CosineDecaySchedule(
             warmup_steps=1_000,
             peak_lr=5e-5,
@@ -968,6 +1147,97 @@ _CONFIGS = [
     # RoboArena & PolaRiS configs.
     *roboarena_config.get_roboarena_configs(),
     *polaris_config.get_polaris_configs(),
+    # π₀.₅ DROID 子任务 LoRA fine-tuning (RLDS)
+    *[
+        TrainConfig(
+            name=f"pi05_droid_lora_{action}",
+            model=pi0_config.Pi0Config(
+                pi05=True,
+                action_dim=32,
+                action_horizon=16,
+                paligemma_variant="gemma_2b_lora",
+                action_expert_variant="gemma_300m_lora",
+            ),
+            data=RLDSDroidDataConfig(
+                repo_id="droid",
+                rlds_data_dir=f"/data/Embobrain/dataset/droid_rlds_split_padded_by_action/{action}",
+                action_space=droid_rlds_dataset.DroidActionSpace.JOINT_POSITION,
+                datasets=(
+                    droid_rlds_dataset.RLDSDataset(
+                        name="droid",
+                        version="0.0.1",
+                        weight=1.0,
+                        filter_dict_path=None,
+                    ),
+                ),
+                assets=AssetsConfig(
+                    assets_dir="gs://openpi-assets/checkpoints/pi05_base/assets/",
+                    asset_id="droid",
+                ),
+            ),
+            batch_size=256,
+            lr_schedule=_optimizer.CosineDecaySchedule(
+                warmup_steps=1_000,
+                peak_lr=2e-4,
+                decay_steps=1_000_000,
+                decay_lr=2e-4,
+            ),
+            optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+            ema_decay=None,
+            weight_loader=weight_loaders.CheckpointWeightLoader("/data/Embobrain/modelsrepo/pi05_base/params"),
+            freeze_filter=pi0_config.Pi0Config(
+                pi05=True,
+                action_dim=32,
+                action_horizon=16,
+                paligemma_variant="gemma_2b_lora",
+                action_expert_variant="gemma_300m_lora",
+            ).get_freeze_filter(),
+            num_train_steps=20_000,
+            save_interval=2_000,
+            num_workers=0,
+        )
+        for action, subtask_cfg in _DROID_SUBTASK_CONFIGS.items()
+    ],
+    # π₀.₅ LIBERO 子任务 LoRA fine-tuning from DROID 子任务 LoRA checkpoint.
+    *[
+        TrainConfig(
+            name=f"pi05_libero_lora_from_droid_{action}",
+            model=pi0_config.Pi0Config(
+                pi05=True,
+                action_horizon=10,
+                discrete_state_input=False,
+                paligemma_variant="gemma_2b_lora",
+                action_expert_variant="gemma_300m_lora",
+            ),
+            data=LeRobotLiberoDataConfig(
+                repo_id=f"modified_libero_lerobot_split_padded_by_action/{action}",
+                base_config=DataConfig(prompt_from_task=True),
+                extra_delta_transform=False,
+            ),
+            batch_size=256,
+            lr_schedule=_optimizer.CosineDecaySchedule(
+                warmup_steps=5_000,
+                peak_lr=2e-4,
+                decay_steps=1_000_000,
+                decay_lr=2e-4,
+            ),
+            optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+            ema_decay=None,
+            weight_loader=weight_loaders.CheckpointWeightLoader(
+                f"/data/Embobrain/openpi/checkpoints/pi05_droid_lora_{action}/droid_lora_{action}/{_DROID_SUBTASK_CONFIGS[action]['steps'] - 1}/params"
+            ),
+            freeze_filter=pi0_config.Pi0Config(
+                pi05=True,
+                action_horizon=10,
+                discrete_state_input=False,
+                paligemma_variant="gemma_2b_lora",
+                action_expert_variant="gemma_300m_lora",
+            ).get_freeze_filter(),
+            num_train_steps=20_000,
+            save_interval=2_000,
+        )
+        for action, subtask_cfg in _LIBERO_SUBTASK_CONFIGS.items()
+    ],
 ]
 
 if len({config.name for config in _CONFIGS}) != len(_CONFIGS):

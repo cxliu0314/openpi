@@ -213,7 +213,9 @@ class DeltaActions(DataTransformFn):
         if "actions" not in data or self.mask is None:
             return data
 
-        state, actions = data["state"], data["actions"]
+        state = data["state"]
+        # Make a writable copy of actions if it's read-only (e.g., from TensorFlow)
+        actions = np.array(data["actions"], copy=True) if not data["actions"].flags.writeable else data["actions"]
         mask = np.asarray(self.mask)
         dims = mask.shape[-1]
         actions[..., :dims] -= np.expand_dims(np.where(mask, state[..., :dims], 0), axis=-2)

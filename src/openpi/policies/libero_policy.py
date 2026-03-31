@@ -80,6 +80,19 @@ class LiberoInputs(transforms.DataTransformFn):
         if "prompt" in data:
             inputs["prompt"] = data["prompt"]
 
+        for metadata_key in (
+            "frame_index",
+            "episode_index",
+            "episode_len",
+            "step_id",
+            "progress",
+            "index",
+            "timestamp",
+            "task_index",
+        ):
+            if metadata_key in data:
+                inputs[metadata_key] = data[metadata_key]
+
         return inputs
 
 

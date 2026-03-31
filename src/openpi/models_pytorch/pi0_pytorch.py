@@ -49,6 +49,25 @@ def sample_beta(alpha, beta, bsize, device):
     return dist.sample((bsize,))
 
 
+class ProgressHead(nn.Module):
+    def __init__(self, input_dim: int, hidden_dim: int | None = None, mid_dim: int | None = None):
+        super().__init__()
+        hidden_dim = min(input_dim, max(input_dim // 2, 256)) if hidden_dim is None else hidden_dim
+        mid_dim = min(hidden_dim, max(hidden_dim // 4, 64)) if mid_dim is None else mid_dim
+        self.input_dim = input_dim
+        self.hidden_dim = hidden_dim
+        self.mid_dim = mid_dim
+        self.fc1 = nn.Linear(input_dim, hidden_dim)
+        self.fc2 = nn.Linear(hidden_dim, mid_dim)
+        self.fc3 = nn.Linear(mid_dim, 1)
+
+    def predict_progress(self, hidden_states: Tensor) -> Tensor:
+        x = torch.relu(self.fc1(hidden_states))
+        x = torch.relu(self.fc2(x))
+        x = self.fc3(x)
+        return torch.sigmoid(x.squeeze(-1))
+
+
 def make_att_2d_masks(pad_masks, att_masks):
     """Copied from big_vision.
 
@@ -99,6 +118,9 @@ class PI0Pytorch(nn.Module):
 
         self.action_in_proj = nn.Linear(config.action_dim, action_expert_config.width)
         self.action_out_proj = nn.Linear(action_expert_config.width, config.action_dim)
+        self.enable_progress_head = bool(getattr(config, "enable_progress_head", self.pi05))
+        self.progress_out_proj = ProgressHead(paligemma_config.width) if self.enable_progress_head else None
+        self.progress_out_proj_action = ProgressHead(action_expert_config.width) if self.enable_progress_head else None
 
         if self.pi05:
             self.time_mlp_in = nn.Linear(action_expert_config.width, action_expert_config.width)
@@ -314,8 +336,56 @@ class PI0Pytorch(nn.Module):
 
         return embs, pad_masks, att_masks, adarms_cond
 
-    def forward(self, observation, actions, noise=None, time=None) -> Tensor:
-        """Do a full training forward pass and compute the loss (batch_size x num_steps x num_motors)"""
+    def _pool_prefix_features(self, prefix_hidden_states: Tensor, prefix_pad_masks: Tensor) -> Tensor:
+        weights = prefix_pad_masks.to(dtype=torch.float32).unsqueeze(-1)
+        denom = torch.clamp(weights.sum(dim=1), min=1.0)
+        pooled = (prefix_hidden_states.to(dtype=torch.float32) * weights).sum(dim=1) / denom
+        return pooled.to(dtype=torch.float32)
+
+    def _encode_suffix_tokens(
+        self,
+        prefix_embs: Tensor,
+        prefix_pad_masks: Tensor,
+        prefix_att_masks: Tensor,
+        state: Tensor,
+        noisy_actions: Tensor,
+        timestep: Tensor,
+    ) -> tuple[Tensor, Tensor]:
+        suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = self.embed_suffix(state, noisy_actions, timestep)
+        if (
+            self.paligemma_with_expert.paligemma.language_model.layers[0].self_attn.q_proj.weight.dtype
+            == torch.bfloat16
+        ):
+            suffix_embs = suffix_embs.to(dtype=torch.bfloat16)
+            prefix_embs = prefix_embs.to(dtype=torch.bfloat16)
+
+        pad_masks = torch.cat([prefix_pad_masks, suffix_pad_masks], dim=1)
+        att_masks = torch.cat([prefix_att_masks, suffix_att_masks], dim=1)
+
+        att_2d_masks = make_att_2d_masks(pad_masks, att_masks)
+        position_ids = torch.cumsum(pad_masks, dim=1) - 1
+        att_2d_masks_4d = self._prepare_attention_masks_4d(att_2d_masks)
+
+        def forward_func(prefix_embs, suffix_embs, att_2d_masks_4d, position_ids, adarms_cond):
+            (prefix_out, suffix_out), _ = self.paligemma_with_expert.forward(
+                attention_mask=att_2d_masks_4d,
+                position_ids=position_ids,
+                past_key_values=None,
+                inputs_embeds=[prefix_embs, suffix_embs],
+                use_cache=False,
+                adarms_cond=[None, adarms_cond],
+            )
+            return prefix_out, suffix_out
+
+        prefix_out, suffix_out = self._apply_checkpoint(
+            forward_func, prefix_embs, suffix_embs, att_2d_masks_4d, position_ids, adarms_cond
+        )
+        prefix_out = prefix_out.to(dtype=torch.float32)
+        suffix_out = suffix_out[:, -self.config.action_horizon :]
+        suffix_out = suffix_out.to(dtype=torch.float32)
+        return prefix_out, suffix_out
+
+    def _forward_action_tokens(self, observation, actions, noise=None, time=None):
         images, img_masks, lang_tokens, lang_masks, state = self._preprocess_observation(observation, train=True)
 
         if noise is None:
@@ -329,49 +399,83 @@ class PI0Pytorch(nn.Module):
         u_t = noise - actions
 
         prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(images, img_masks, lang_tokens, lang_masks)
-        suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = self.embed_suffix(state, x_t, time)
-        if (
-            self.paligemma_with_expert.paligemma.language_model.layers[0].self_attn.q_proj.weight.dtype
-            == torch.bfloat16
-        ):
-            suffix_embs = suffix_embs.to(dtype=torch.bfloat16)
-            prefix_embs = prefix_embs.to(dtype=torch.bfloat16)
-
-        pad_masks = torch.cat([prefix_pad_masks, suffix_pad_masks], dim=1)
-        att_masks = torch.cat([prefix_att_masks, suffix_att_masks], dim=1)
-
-        att_2d_masks = make_att_2d_masks(pad_masks, att_masks)
-        position_ids = torch.cumsum(pad_masks, dim=1) - 1
-
-        # Prepare attention masks
-        att_2d_masks_4d = self._prepare_attention_masks_4d(att_2d_masks)
-
-        # Apply gradient checkpointing if enabled
-        def forward_func(prefix_embs, suffix_embs, att_2d_masks_4d, position_ids, adarms_cond):
-            (_, suffix_out), _ = self.paligemma_with_expert.forward(
-                attention_mask=att_2d_masks_4d,
-                position_ids=position_ids,
-                past_key_values=None,
-                inputs_embeds=[prefix_embs, suffix_embs],
-                use_cache=False,
-                adarms_cond=[None, adarms_cond],
-            )
-            return suffix_out
-
-        suffix_out = self._apply_checkpoint(
-            forward_func, prefix_embs, suffix_embs, att_2d_masks_4d, position_ids, adarms_cond
+        prefix_out, suffix_out = self._encode_suffix_tokens(
+            prefix_embs, prefix_pad_masks, prefix_att_masks, state, x_t, time
         )
 
-        suffix_out = suffix_out[:, -self.config.action_horizon :]
-        suffix_out = suffix_out.to(dtype=torch.float32)
+        return u_t, prefix_out, prefix_pad_masks, suffix_out
 
-        # Apply gradient checkpointing to final action projection if enabled
+    def forward(self, observation, actions, noise=None, time=None) -> Tensor:
+        """Do a full training forward pass and compute the loss (batch_size x num_steps x num_motors)"""
+        u_t, _prefix_out, _prefix_pad_masks, suffix_out = self._forward_action_tokens(
+            observation, actions, noise=noise, time=time
+        )
+
         def action_out_proj_func(suffix_out):
             return self.action_out_proj(suffix_out)
 
         v_t = self._apply_checkpoint(action_out_proj_func, suffix_out)
-
         return F.mse_loss(u_t, v_t, reduction="none")
+
+    def compute_action_and_progress(self, observation, actions, noise=None, time=None):
+        u_t, prefix_out, prefix_pad_masks, suffix_out = self._forward_action_tokens(
+            observation, actions, noise=noise, time=time
+        )
+
+        def action_out_proj_func(suffix_out):
+            return self.action_out_proj(suffix_out)
+
+        v_t = self._apply_checkpoint(action_out_proj_func, suffix_out)
+        chunked_loss = F.mse_loss(u_t, v_t, reduction="none").mean(dim=-1)
+
+        if not self.enable_progress_head or self.progress_out_proj is None:
+            return chunked_loss, None
+
+        progress_feature = self._pool_prefix_features(prefix_out, prefix_pad_masks)
+        progress_pred = self.progress_out_proj.predict_progress(progress_feature)
+        return chunked_loss, progress_pred
+
+    def compute_action_and_progress_low_noise(self, observation, actions, noise=None, time=None, progress_t=0.001):
+        images, img_masks, lang_tokens, lang_masks, state = self._preprocess_observation(observation, train=True)
+
+        if noise is None:
+            noise = self.sample_noise(actions.shape, actions.device)
+
+        if time is None:
+            time = self.sample_time(actions.shape[0], actions.device)
+
+        time_expanded = time[:, None, None]
+        x_t = time_expanded * noise + (1 - time_expanded) * actions
+        u_t = noise - actions
+
+        prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(images, img_masks, lang_tokens, lang_masks)
+        _prefix_out, suffix_out = self._encode_suffix_tokens(
+            prefix_embs, prefix_pad_masks, prefix_att_masks, state, x_t, time
+        )
+
+        def action_out_proj_func(suffix_out):
+            return self.action_out_proj(suffix_out)
+
+        v_t = self._apply_checkpoint(action_out_proj_func, suffix_out)
+        chunked_loss = F.mse_loss(u_t, v_t, reduction="none").mean(dim=-1)
+
+        if not self.enable_progress_head or self.progress_out_proj_action is None:
+            return chunked_loss, None
+
+        progress_time = torch.full(
+            (actions.shape[0],),
+            float(progress_t),
+            dtype=actions.dtype,
+            device=actions.device,
+        )
+        progress_time_expanded = progress_time[:, None, None]
+        clean_actions = (1 - progress_time_expanded) * actions
+        _progress_prefix_out, progress_suffix_out = self._encode_suffix_tokens(
+            prefix_embs, prefix_pad_masks, prefix_att_masks, state, clean_actions, progress_time
+        )
+        progress_feature = progress_suffix_out[:, 0, :]
+        progress_pred = self.progress_out_proj_action.predict_progress(progress_feature)
+        return chunked_loss, progress_pred
 
     @torch.no_grad()
     def sample_actions(self, device, observation, noise=None, num_steps=10) -> Tensor:

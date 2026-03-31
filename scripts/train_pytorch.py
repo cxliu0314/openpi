@@ -69,6 +69,20 @@ def init_logging():
         logger.handlers[0].setFormatter(formatter)
 
 
+def _compute_action_and_progress_with_mode(model, config: _config.TrainConfig, observation, actions):
+    if config.progress_readout_mode == "low_noise_action" and hasattr(model, "compute_action_and_progress_low_noise"):
+        return model.compute_action_and_progress_low_noise(observation, actions)
+    if hasattr(model, "compute_action_and_progress"):
+        return model.compute_action_and_progress(observation, actions)
+
+    raw_loss = model(observation, actions)
+    if isinstance(raw_loss, list | tuple):
+        raw_loss = torch.stack(raw_loss)
+    elif not isinstance(raw_loss, torch.Tensor):
+        raw_loss = torch.tensor(raw_loss, device=actions.device, dtype=torch.float32)
+    return raw_loss.mean(dim=-1), None
+
+
 def init_wandb(config: _config.TrainConfig, *, resuming: bool, enabled: bool = True):
     """Initialize wandb logging."""
     if not enabled:
@@ -357,6 +371,14 @@ def train_loop(config: _config.TrainConfig):
 
     # Pass the original batch size to data loader - it will handle DDP splitting internally
     loader, data_config = build_datasets(config)
+    val_loader = None
+    if config.use_val_set:
+        val_loader = _data.create_data_loader(
+            config,
+            framework="pytorch",
+            shuffle=False,
+            num_batches=max(1, config.val_num_batches),
+        )
 
     # Log sample images to wandb on first batch
     if is_main and config.wandb_enabled and not resuming:
@@ -364,7 +386,7 @@ def train_loop(config: _config.TrainConfig):
         sample_data_loader = _data.create_data_loader(config, framework="pytorch", shuffle=False)
         sample_batch = next(iter(sample_data_loader))
         # Convert observation and actions to torch tensors
-        observation, actions = sample_batch
+        observation, actions, _progress_target, _episode_hash = sample_batch
         sample_batch = observation.to_dict()
         sample_batch["actions"] = actions
 
@@ -469,6 +491,69 @@ def train_loop(config: _config.TrainConfig):
         global_step = load_checkpoint(model, optim, config.checkpoint_dir, device)
         logging.info(f"Resumed training from step {global_step}")
 
+    def split_masks(episode_hash: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        if config.use_val_set:
+            bucket = 1000
+            threshold = int(config.val_split_ratio * bucket)
+            val_mask = torch.remainder(torch.abs(episode_hash.to(torch.int64)), bucket) < threshold
+        else:
+            val_mask = torch.zeros_like(episode_hash, dtype=torch.bool)
+        return ~val_mask, val_mask
+
+    def masked_mean(values: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+        mask_f = mask.to(dtype=values.dtype)
+        denom = torch.clamp(mask_f.sum(), min=1.0)
+        return (values * mask_f).sum() / denom
+
+    @torch.no_grad()
+    def evaluate(model_for_eval, val_data_loader):
+        model_for_eval.eval()
+        val_infos = []
+        for observation, actions, progress_target, episode_hash in val_data_loader:
+            observation = jax.tree.map(lambda x: x.to(device), observation)
+            actions = actions.to(torch.float32).to(device)
+            progress_target = progress_target.to(torch.float32).to(device)
+            episode_hash = episode_hash.to(torch.int64).to(device)
+
+            _, val_mask = split_masks(episode_hash)
+
+            chunked_loss, progress_pred = _compute_action_and_progress_with_mode(
+                model_for_eval, config, observation, actions
+            )
+
+            action_loss_per_sample = chunked_loss.mean(dim=-1)
+            action_loss = masked_mean(action_loss_per_sample, val_mask)
+
+            if config.enable_progress_loss and progress_pred is not None:
+                progress_target = progress_target.reshape_as(progress_pred)
+                progress_loss_per_sample = torch.square(progress_pred - progress_target)
+                progress_loss = masked_mean(progress_loss_per_sample, val_mask)
+            else:
+                progress_loss = torch.zeros_like(action_loss)
+
+            total_loss = action_loss + config.progress_loss_weight * progress_loss
+            val_infos.append(
+                {
+                    "val/action_loss": float(action_loss.item()),
+                    "val/progress_loss": float(progress_loss.item()),
+                    "val/total_loss": float(total_loss.item()),
+                }
+            )
+
+        model_for_eval.train()
+
+        if not val_infos:
+            return {
+                "val/action_loss": 0.0,
+                "val/progress_loss": 0.0,
+                "val/total_loss": 0.0,
+            }
+
+        return {
+            key: sum(info[key] for info in val_infos) / len(val_infos)
+            for key in ("val/action_loss", "val/progress_loss", "val/total_loss")
+        }
+
     def lr_schedule(step: int):
         if step < warmup_steps:
             # Match JAX behavior: start from peak_lr / (warmup_steps + 1)
@@ -511,29 +596,36 @@ def train_loop(config: _config.TrainConfig):
         if use_ddp and hasattr(loader, "set_epoch"):
             loader.set_epoch(global_step // len(loader))
 
-        for observation, actions in loader:
+        for observation, actions, progress_target, episode_hash in loader:
             # Check if we've reached the target number of steps
             if global_step >= config.num_train_steps:
                 break
 
-            # The unified data loader returns (observation, actions) tuple
             observation = jax.tree.map(lambda x: x.to(device), observation)  # noqa: PLW2901
             actions = actions.to(torch.float32)  # noqa: PLW2901
             actions = actions.to(device)  # noqa: PLW2901
+            progress_target = progress_target.to(torch.float32).to(device)  # noqa: PLW2901
+            episode_hash = episode_hash.to(torch.int64).to(device)  # noqa: PLW2901
+
+            train_mask, _ = split_masks(episode_hash)
 
             # Update LR
             for pg in optim.param_groups:
                 pg["lr"] = lr_schedule(global_step)
 
-            # Forward pass
-            losses = model(observation, actions)
-            # Ensure losses is a tensor and handle different return types
-            if isinstance(losses, list | tuple):
-                losses = torch.stack(losses)
-            elif not isinstance(losses, torch.Tensor):
-                losses = torch.tensor(losses, device=device, dtype=torch.float32)
+            chunked_loss, progress_pred = _compute_action_and_progress_with_mode(model, config, observation, actions)
 
-            loss = losses.mean()
+            action_loss_per_sample = chunked_loss.mean(dim=-1)
+            action_loss = masked_mean(action_loss_per_sample, train_mask)
+
+            if config.enable_progress_loss and progress_pred is not None:
+                progress_target = progress_target.reshape_as(progress_pred)
+                progress_loss_per_sample = torch.square(progress_pred - progress_target)
+                progress_loss = masked_mean(progress_loss_per_sample, train_mask)
+            else:
+                progress_loss = torch.zeros_like(action_loss)
+
+            loss = action_loss + config.progress_loss_weight * progress_loss
 
             # Backward pass
             loss.backward()
@@ -559,7 +651,9 @@ def train_loop(config: _config.TrainConfig):
             if is_main:
                 infos.append(
                     {
-                        "loss": loss.item(),
+                        "train/action_loss": action_loss.item(),
+                        "train/progress_loss": progress_loss.item(),
+                        "train/total_loss": loss.item(),
                         "learning_rate": optim.param_groups[0]["lr"],
                         "grad_norm": float(grad_norm) if isinstance(grad_norm, torch.Tensor) else grad_norm,
                     }
@@ -569,7 +663,9 @@ def train_loop(config: _config.TrainConfig):
                 elapsed = time.time() - start_time
 
                 # Average stats over log interval
-                avg_loss = sum(info["loss"] for info in infos) / len(infos)
+                avg_action_loss = sum(info["train/action_loss"] for info in infos) / len(infos)
+                avg_progress_loss = sum(info["train/progress_loss"] for info in infos) / len(infos)
+                avg_total_loss = sum(info["train/total_loss"] for info in infos) / len(infos)
                 avg_lr = sum(info["learning_rate"] for info in infos) / len(infos)
 
                 avg_grad_norm = None
@@ -580,21 +676,26 @@ def train_loop(config: _config.TrainConfig):
                     if len(vals) > 0:
                         avg_grad_norm = sum(vals) / len(vals)
                 logging.info(
-                    f"step={global_step} loss={avg_loss:.4f} lr={avg_lr:.2e} grad_norm={avg_grad_norm:.2f} time={elapsed:.1f}s"
+                    f"step={global_step} total={avg_total_loss:.4f} action={avg_action_loss:.4f} progress={avg_progress_loss:.4f} lr={avg_lr:.2e} grad_norm={avg_grad_norm:.2f} time={elapsed:.1f}s"
                     if avg_grad_norm is not None
-                    else f"step={global_step} loss={avg_loss:.4f} lr={avg_lr:.2e} time={elapsed:.1f}s"
+                    else f"step={global_step} total={avg_total_loss:.4f} action={avg_action_loss:.4f} progress={avg_progress_loss:.4f} lr={avg_lr:.2e} time={elapsed:.1f}s"
                 )
 
                 # Log to wandb
                 if config.wandb_enabled and len(infos) > 0:
                     log_payload = {
-                        "loss": avg_loss,
+                        "train/action_loss": avg_action_loss,
+                        "train/progress_loss": avg_progress_loss,
+                        "train/total_loss": avg_total_loss,
                         "learning_rate": avg_lr,
                         "step": global_step,
                         "time_per_step": elapsed / config.log_interval,
                     }
                     if avg_grad_norm is not None:
                         log_payload["grad_norm"] = avg_grad_norm
+                    if config.use_val_set and val_loader is not None and global_step > 0 and global_step % config.val_interval == 0:
+                        eval_model = model.module if isinstance(model, torch.nn.parallel.DistributedDataParallel) else model
+                        log_payload.update(evaluate(eval_model, val_loader))
                     wandb.log(log_payload, step=global_step)
 
                 start_time = time.time()
@@ -608,7 +709,13 @@ def train_loop(config: _config.TrainConfig):
             if pbar is not None:
                 pbar.update(1)
                 pbar.set_postfix(
-                    {"loss": f"{loss.item():.4f}", "lr": f"{optim.param_groups[0]['lr']:.2e}", "step": global_step}
+                    {
+                        "total": f"{loss.item():.4f}",
+                        "action": f"{action_loss.item():.4f}",
+                        "progress": f"{progress_loss.item():.4f}",
+                        "lr": f"{optim.param_groups[0]['lr']:.2e}",
+                        "step": global_step,
+                    }
                 )
 
     # Close progress bar
