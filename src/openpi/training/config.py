@@ -532,25 +532,10 @@ class TrainConfig:
     enable_progress_loss: bool = True
     # Weight of progress loss term in total loss.
     progress_loss_weight: float = 0.1
-    # Weight of the relative-progress loss term for current+relative readout modes.
-    progress_relative_loss_weight: float = 0.25
     # Controls how progress supervision targets are constructed.
-    progress_target_mode: Literal["scalar", "chunk"] = "scalar"
+    progress_target_mode: Literal["chunk"] = "chunk"
     # Controls which model interface is used to produce progress predictions.
-    progress_readout_mode: Literal[
-        "prefix",
-        "low_noise_action",
-        "chunk_prefix",
-        "chunk_prefix_large",
-        "chunk_low_noise_action",
-        "chunk_hybrid_concat",
-        "chunk_self_action",
-        "chunk_hybrid_self_action",
-        "chunk_hybrid_self_action_large",
-        "chunk_multilayer_self_action",
-        "chunk_current_relative_flat",
-        "chunk_current_relative_multilayer",
-    ] = "prefix"
+    progress_readout_mode: Literal["chunk_prefix"] = "chunk_prefix"
 
     # Validation options.
     use_val_set: bool = True
@@ -870,7 +855,7 @@ _CONFIGS = [
             base_config=DataConfig(prompt_from_task=True),
             extra_delta_transform=False,
             assets=AssetsConfig(
-                assets_dir="/data/Embobrain/openpi/assets/pi05_libero_lora_from_droid",
+                assets_dir="/data/Embobrain/openpi/assets/pi05_libero_lora",
                 asset_id="modified_libero_lerobot_split_padded/libero_10_no_noops",
             ),
         ),
@@ -884,7 +869,7 @@ _CONFIGS = [
         optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
         ema_decay=None,
         weight_loader=weight_loaders.CheckpointWeightLoader(
-            "/data/Embobrain/openpi/checkpoints/pi05_libero_lora/libero_lora_finetune/29999/params"
+            "/data/Embobrain/openpi/checkpoints/pi05_libero_lora/libero_lora_finetune_256/29999/params"
         ),
         freeze_filter=pi0_config.Pi0Config(
             pi05=True,

@@ -50,8 +50,8 @@ class CheckpointWeightLoader(WeightLoader):
     def load(self, params: at.Params) -> at.Params:
         # We are loading np.ndarray and relying on the training code to properly convert and shard the params.
         loaded_params = _model.restore_params(download.maybe_download(self.params_path), restore_type=np.ndarray)
-        # Add missing LoRA weights and newly introduced progress head weights.
-        return _merge_params(loaded_params, params, missing_regex=".*lora.*|.*progress_out_proj.*|.*progress_chunk.*")
+        # Add missing LoRA weights and newly introduced chunk-prefix progress head weights.
+        return _merge_params(loaded_params, params, missing_regex=".*lora.*|.*progress_chunk.*")
 
 
 @dataclasses.dataclass(frozen=True)

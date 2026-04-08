@@ -59,33 +59,48 @@ class Policy(BasePolicy):
             self._model = self._model.to(pytorch_device)
             self._model.eval()
             self._sample_actions = model.sample_actions
+            self._infer_actions_and_progress = None
         else:
             # JAX model setup
             self._sample_actions = nnx_utils.module_jit(model.sample_actions)
-            self._rng = rng or jax.random.key(0)
+            self._rng = jax.random.key(0) if rng is None else rng
+            infer_actions_and_progress = getattr(model, "infer_actions_and_progress", None)
+            self._infer_actions_and_progress = (
+                nnx_utils.module_jit(
+                    infer_actions_and_progress,
+                    static_argnames=("readout_mode", "num_steps"),
+                )
+                if infer_actions_and_progress is not None
+                else None
+            )
 
-    @override
-    def infer(self, obs: dict, *, noise: np.ndarray | None = None) -> dict:  # type: ignore[misc]
+    def _prepare_inputs(self, obs: dict):
         # Make a copy since transformations may modify the inputs in place.
         inputs = jax.tree.map(lambda x: x, obs)
         inputs = self._input_transform(inputs)
         if not self._is_pytorch_model:
-            # Make a batch and convert to jax.Array.
             inputs = jax.tree.map(lambda x: jnp.asarray(x)[np.newaxis, ...], inputs)
             self._rng, sample_rng_or_pytorch_device = jax.random.split(self._rng)
         else:
-            # Convert inputs to PyTorch tensors and move to correct device
             inputs = jax.tree.map(lambda x: torch.from_numpy(np.array(x)).to(self._pytorch_device)[None, ...], inputs)
             sample_rng_or_pytorch_device = self._pytorch_device
+        return inputs, sample_rng_or_pytorch_device
 
-        # Prepare kwargs for sample_actions
+    def _prepare_sample_kwargs(self, noise: np.ndarray | None) -> dict[str, Any]:
         sample_kwargs = dict(self._sample_kwargs)
-        if noise is not None:
-            noise = torch.from_numpy(noise).to(self._pytorch_device) if self._is_pytorch_model else jnp.asarray(noise)
+        if noise is None:
+            return sample_kwargs
 
-            if noise.ndim == 2:  # If noise is (action_horizon, action_dim), add batch dimension
-                noise = noise[None, ...]  # Make it (1, action_horizon, action_dim)
-            sample_kwargs["noise"] = noise
+        noise = torch.from_numpy(noise).to(self._pytorch_device) if self._is_pytorch_model else jnp.asarray(noise)
+        if noise.ndim == 2:
+            noise = noise[None, ...]
+        sample_kwargs["noise"] = noise
+        return sample_kwargs
+
+    @override
+    def infer(self, obs: dict, *, noise: np.ndarray | None = None) -> dict:  # type: ignore[misc]
+        inputs, sample_rng_or_pytorch_device = self._prepare_inputs(obs)
+        sample_kwargs = self._prepare_sample_kwargs(noise)
 
         observation = _model.Observation.from_dict(inputs)
         start_time = time.monotonic()
@@ -100,6 +115,43 @@ class Policy(BasePolicy):
             outputs = jax.tree.map(lambda x: np.asarray(x[0, ...]), outputs)
 
         outputs = self._output_transform(outputs)
+        outputs["policy_timing"] = {
+            "infer_ms": model_time * 1000,
+        }
+        return outputs
+
+    def infer_with_progress(
+        self,
+        obs: dict,
+        *,
+        readout_mode: str = "chunk_prefix",
+        noise: np.ndarray | None = None,
+    ) -> dict:
+        if self._is_pytorch_model:
+            raise NotImplementedError("infer_with_progress is only supported for JAX policies.")
+        if self._infer_actions_and_progress is None:
+            raise NotImplementedError("Underlying model does not implement infer_actions_and_progress.")
+
+        inputs, sample_rng = self._prepare_inputs(obs)
+        sample_kwargs = self._prepare_sample_kwargs(noise)
+        observation = _model.Observation.from_dict(inputs)
+
+        start_time = time.monotonic()
+        actions, progress = self._infer_actions_and_progress(
+            sample_rng,
+            observation,
+            readout_mode=readout_mode,
+            **sample_kwargs,
+        )
+        model_time = time.monotonic() - start_time
+
+        outputs = {
+            "state": inputs["state"],
+            "actions": actions,
+        }
+        outputs = jax.tree.map(lambda x: np.asarray(x[0, ...]), outputs)
+        outputs = self._output_transform(outputs)
+        outputs["progress"] = None if progress is None else np.asarray(progress[0, ...])
         outputs["policy_timing"] = {
             "infer_ms": model_time * 1000,
         }

@@ -31,7 +31,7 @@ export HF_HOME="/home/dataset-local/zxlei/.cache/huggingface"
 CONFIG_NAME="pi05_libero_lora"
 
 # 实验名称（checkpoint 保存子目录）
-EXP_NAME="libero_lora_finetune_256"
+EXP_NAME="libero_lora_finetune"
 
 # 训练步数 & batch size
 # LoRA 微调使用较小 batch size 以适应有限显存

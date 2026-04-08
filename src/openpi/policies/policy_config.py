@@ -3,6 +3,8 @@ import os
 import pathlib
 from typing import Any
 
+import flax.nnx as nnx
+import jax
 import jax.numpy as jnp
 
 import openpi.models.model as _model
@@ -11,6 +13,12 @@ import openpi.shared.download as download
 from openpi.training import checkpoints as _checkpoints
 from openpi.training import config as _config
 import openpi.transforms as transforms
+
+
+def _merge_param_trees(base: Any, loaded: Any) -> Any:
+    if isinstance(base, dict) and isinstance(loaded, dict):
+        return {key: _merge_param_trees(base[key], loaded[key]) if key in loaded else base[key] for key in base}
+    return loaded
 
 
 def create_trained_policy(
@@ -22,6 +30,8 @@ def create_trained_policy(
     default_prompt: str | None = None,
     norm_stats: dict[str, transforms.NormStats] | None = None,
     pytorch_device: str | None = None,
+    rng: jax.Array | None = None,
+    allow_partial_params: bool = False,
 ) -> _policy.Policy:
     """Create a policy from a trained checkpoint.
 
@@ -54,7 +64,15 @@ def create_trained_policy(
         model = train_config.model.load_pytorch(train_config, weight_path)
         model.paligemma_with_expert.to_bfloat16_for_selected_params("bfloat16")
     else:
-        model = train_config.model.load(_model.restore_params(checkpoint_dir / "params", dtype=jnp.bfloat16))
+        params = _model.restore_params(checkpoint_dir / "params", dtype=jnp.bfloat16)
+        if allow_partial_params:
+            model = nnx.eval_shape(train_config.model.create, jax.random.key(0))
+            graphdef, state = nnx.split(model)
+            merged_params = _merge_param_trees(state.to_pure_dict(), params)
+            state.replace_by_pure_dict(merged_params)
+            model = nnx.merge(graphdef, state)
+        else:
+            model = train_config.model.load(params)
     data_config = train_config.data.create(train_config.assets_dirs, train_config.model)
     if norm_stats is None:
         # We are loading the norm stats from the checkpoint instead of the config assets dir to make sure
@@ -74,6 +92,7 @@ def create_trained_policy(
 
     return _policy.Policy(
         model,
+        rng=rng,
         transforms=[
             *repack_transforms.inputs,
             transforms.InjectDefaultPrompt(default_prompt),

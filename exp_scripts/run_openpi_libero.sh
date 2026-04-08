@@ -8,7 +8,8 @@
 set -euo pipefail
 
 OPENPI_DIR="/data/Embobrain/openpi"
-LIBERO_REVISED_RLDS_DIR="/data/Embobrain/dataset_revised/libero/libero_10_no_noops_split_padded"
+UV_BIN="$OPENPI_DIR/.venv/bin/uv"
+LIBERO_REVISED_RLDS_DIR="${LIBERO_REVISED_RLDS_DIR:-/data/Embobrain/dataset_revised/libero/libero_10_split_padded}"
 LIBERO_LEROBOT_REPO_ID="modified_libero_lerobot_split_padded/libero_10_no_noops"
 LIBERO_LEROBOT_LOCAL_DIR="/data/HF_Cache_dataevo/lerobot/${LIBERO_LEROBOT_REPO_ID}"
 LIBERO_NORM_STATS_DIR="/data/Embobrain/openpi/assets/pi05_libero_lora/${LIBERO_LEROBOT_REPO_ID}"
@@ -56,8 +57,8 @@ echo "Progress loss weight:    $PROGRESS_LOSS_WEIGHT"
 echo ""
 
 echo "[Check] Runtime dependencies..."
-if ! command -v uv >/dev/null 2>&1; then
-    echo "ERROR: uv is not installed"
+if [ ! -x "$UV_BIN" ]; then
+    echo "ERROR: uv not found: $UV_BIN"
     exit 1
 fi
 if [ ! -d "$OPENPI_DIR/.venv" ]; then
@@ -74,7 +75,7 @@ if [ ! -d "$LIBERO_REVISED_RLDS_DIR/libero_10_no_noops" ]; then
 fi
 
 echo "[Check] JAX devices..."
-GPU_COUNT=$(uv run python -c "import jax; print(len(jax.devices()))" 2>/dev/null)
+GPU_COUNT=$("$UV_BIN" run python -c "import jax; print(len(jax.devices()))" 2>/dev/null)
 echo "JAX visible GPU:         $GPU_COUNT"
 echo ""
 
@@ -90,7 +91,7 @@ else
         rm -rf "$LIBERO_LEROBOT_LOCAL_DIR"
     fi
 
-    uv run --group rlds python convert_libero10_to_lerobot.py \
+    "$UV_BIN" run --group rlds python convert_libero10_to_lerobot.py \
         --data-dir "$LIBERO_REVISED_RLDS_DIR" \
         --output-dir "$LIBERO_LEROBOT_REPO_ID"
 fi
@@ -114,7 +115,7 @@ else
         rm -rf "$LIBERO_NORM_STATS_DIR"
     fi
 
-    uv run scripts/compute_norm_stats.py --config-name "$CONFIG_NAME"
+    "$UV_BIN" run scripts/compute_norm_stats.py --config-name "$CONFIG_NAME"
 fi
 
 if [ ! -f "$LIBERO_NORM_STATS_DIR/norm_stats.json" ]; then
@@ -128,7 +129,7 @@ echo ""
 # Stage 3/3: train LIBERO LoRA with chunk-prefix progress
 ###############################################################################
 echo "========== [3/3] Train LIBERO LoRA + Chunk Prefix Progress =========="
-uv run scripts/train.py "$CONFIG_NAME" \
+"$UV_BIN" run scripts/train.py "$CONFIG_NAME" \
     --exp-name="$EXP_NAME" \
     --overwrite \
     --num-train-steps=$TRAIN_STEPS \

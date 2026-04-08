@@ -2,6 +2,7 @@
 set -euo pipefail
 
 OPENPI_DIR="/data/Embobrain/openpi"
+UV_BIN="$OPENPI_DIR/.venv/bin/uv"
 CONFIG_NAME="pi05_libero_lora_progress_head"
 EXP_NAME="pi05_libero_lora_chunk_progress_prefix"
 
@@ -68,8 +69,8 @@ echo "XDG cache home:          $XDG_CACHE_HOME"
 echo "Autotune cache dir:      $AUTOTUNE_CACHE_DIR"
 echo ""
 
-if ! command -v uv >/dev/null 2>&1; then
-  echo "ERROR: uv is not installed"
+if [ ! -x "$UV_BIN" ]; then
+  echo "ERROR: uv not found: $UV_BIN"
   exit 1
 fi
 
@@ -89,7 +90,7 @@ else
   WANDB_FLAG=""
 fi
 
-uv run python scripts/train_chunk_progress_head_only.py \
+"$UV_BIN" run python scripts/train_chunk_progress_head_only.py \
   --config-name "$CONFIG_NAME" \
   --exp-name "$EXP_NAME" \
   --init-ckpt "$INIT_CKPT" \

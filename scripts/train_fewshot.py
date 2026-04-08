@@ -14,6 +14,7 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 import tqdm_loggable.auto as tqdm
+import tyro
 import wandb
 
 import openpi.models.model as _model
@@ -78,6 +79,40 @@ def init_wandb(config: _config.TrainConfig, *, resuming: bool, log_code: bool = 
 
     if log_code:
         wandb.run.log_code(epath.Path(__file__).parent.parent)
+
+
+def _add_canonical_loss_metrics(metrics: dict[str, Any]) -> dict[str, Any]:
+    """Add canonical aliases used for monitoring and console summaries."""
+    if "train/total_loss" in metrics:
+        metrics["train/loss"] = metrics["train/total_loss"]
+    elif "loss" in metrics:
+        metrics["train/loss"] = metrics["loss"]
+    if "val/total_loss" in metrics:
+        metrics["val/loss"] = metrics["val/total_loss"]
+    return metrics
+
+
+def _core_wandb_metrics(metrics: dict[str, Any]) -> dict[str, Any]:
+    """Keep W&B focused on comparable train/* and val/* metrics only."""
+    core: dict[str, Any] = {}
+    for key in (
+        "train/loss",
+        "train/action_loss",
+        "train/progress_loss",
+        "val/loss",
+        "val/action_loss",
+        "val/progress_loss",
+    ):
+        if key in metrics:
+            core[key] = metrics[key]
+
+    if "early_stop/best_val_metric" in metrics:
+        core["val/best_loss"] = metrics["early_stop/best_val_metric"]
+    if "early_stop/best_val_step" in metrics:
+        core["val/best_step"] = metrics["early_stop/best_val_step"]
+    if "early_stop/triggered" in metrics:
+        core["val/early_stop_triggered"] = metrics["early_stop/triggered"]
+    return core
 
 
 def _load_weights_and_validate(loader: _weight_loaders.WeightLoader, params_shape: at.Params) -> at.Params:
@@ -205,13 +240,18 @@ def train_step(
     model.train()
 
     def split_masks(episode_hash: at.Array) -> tuple[at.Array, at.Array]:
-        if config.use_val_set:
+        if config.val_repo_id is not None:
+            train_mask = jnp.ones_like(episode_hash, dtype=jnp.bool_)
+            val_mask = jnp.zeros_like(episode_hash, dtype=jnp.bool_)
+        elif config.use_val_set:
             bucket = 1000
             threshold = int(config.val_split_ratio * bucket)
             val_mask = jnp.mod(jnp.abs(episode_hash.astype(jnp.int32)), bucket) < threshold
+            train_mask = ~val_mask
         else:
             val_mask = jnp.zeros_like(episode_hash, dtype=jnp.bool_)
-        return ~val_mask, val_mask
+            train_mask = ~val_mask
+        return train_mask, val_mask
 
     def masked_mean(values: at.Array, mask: at.Array) -> at.Array:
         mask_f = mask.astype(values.dtype)
@@ -322,9 +362,12 @@ def eval_step(
 
     observation, actions, progress_target, episode_hash = batch
 
-    bucket = 1000
-    threshold = int(config.val_split_ratio * bucket)
-    val_mask = jnp.mod(jnp.abs(episode_hash.astype(jnp.int32)), bucket) < threshold
+    if config.val_repo_id is not None:
+        val_mask = jnp.ones_like(episode_hash, dtype=jnp.bool_)
+    else:
+        bucket = 1000
+        threshold = int(config.val_split_ratio * bucket)
+        val_mask = jnp.mod(jnp.abs(episode_hash.astype(jnp.int32)), bucket) < threshold
 
     def masked_mean(values: at.Array, mask: at.Array) -> at.Array:
         mask_f = mask.astype(values.dtype)
@@ -355,6 +398,7 @@ def eval_step(
         "val/total_loss": total_loss,
         **progress_metrics,
     }
+
 
 def main(config: _config.TrainConfig):
     init_logging()
@@ -391,23 +435,6 @@ def main(config: _config.TrainConfig):
     batch = next(data_iter)
     logging.info(f"Initialized data loader:\n{training_utils.array_tree_to_info(batch)}")
 
-    # Log images from the first local shard on process 0 to avoid cross-device gathers.
-    if config.wandb_enabled and jax.process_index() == 0:
-        local_images = {}
-        for name, img in batch[0].images.items():
-            local_img = img
-            if hasattr(local_img, "addressable_shards") and local_img.addressable_shards:
-                local_img = local_img.addressable_shards[0].data
-            local_images[name] = np.asarray(jax.device_get(local_img))
-
-        if local_images:
-            local_batch_size = min(img.shape[0] for img in local_images.values())
-            images_to_log = [
-                wandb.Image(np.concatenate([img[i] for img in local_images.values()], axis=1))
-                for i in range(min(5, local_batch_size))
-            ]
-            wandb.log({"camera_views": images_to_log}, step=0)
-
     train_state, train_state_sharding = init_train_state(config, init_rng, mesh, resume=resuming)
     jax.block_until_ready(train_state)
     logging.info(f"Initialized train state:\n{training_utils.array_tree_to_info(train_state.params)}")
@@ -429,9 +456,18 @@ def main(config: _config.TrainConfig):
     )
 
     def _create_val_iter():
+        val_config = config
+        if config.val_repo_id is not None:
+            val_assets = config.data.assets
+            if val_assets.asset_id is None:
+                val_assets = dataclasses.replace(val_assets, asset_id=config.data.repo_id)
+            val_config = dataclasses.replace(
+                config,
+                data=dataclasses.replace(config.data, repo_id=config.val_repo_id, assets=val_assets),
+            )
         return iter(
             _data_loader.create_data_loader(
-                config,
+                val_config,
                 sharding=data_sharding,
                 shuffle=False,
                 num_batches=config.val_num_batches if config.use_val_set else None,
@@ -449,6 +485,9 @@ def main(config: _config.TrainConfig):
     )
 
     infos = []
+    best_val_metric = float("inf")
+    best_val_step = start_step
+    early_stop_triggered = False
     for step in pbar:
         with sharding.set_mesh(mesh):
             train_state, info = ptrain_step(train_rng, train_state, batch)
@@ -464,6 +503,7 @@ def main(config: _config.TrainConfig):
                 reduced_info["train/progress_target_mean"] = float(progress_target_np.mean())
             else:
                 progress_sample0_str = "nan"
+            val_ran = False
             if config.use_val_set and step > 0 and step % config.val_interval == 0:
                 val_infos = []
                 for _ in range(max(1, config.val_num_batches)):
@@ -478,10 +518,42 @@ def main(config: _config.TrainConfig):
                 stacked_val_infos = common_utils.stack_forest(val_infos)
                 reduced_val_info = jax.device_get(jax.tree.map(jnp.mean, stacked_val_infos))
                 reduced_info.update(reduced_val_info)
-            info_str = ", ".join(f"{k}={v:.4f}" for k, v in reduced_info.items())
+                val_ran = True
+            reduced_info = _add_canonical_loss_metrics(reduced_info)
+            if val_ran and config.early_stop_patience_steps > 0:
+                monitor_raw = reduced_info.get(config.early_stop_metric)
+                if monitor_raw is None and config.early_stop_metric == "val/loss":
+                    monitor_raw = reduced_info.get("val/total_loss")
+                if monitor_raw is not None:
+                    monitor_value = float(np.asarray(monitor_raw))
+                    if monitor_value < (best_val_metric - config.early_stop_min_delta):
+                        best_val_metric = monitor_value
+                        best_val_step = step
+                        reduced_info["early_stop/best_val_metric"] = best_val_metric
+                        reduced_info["early_stop/best_val_step"] = best_val_step
+                    elif step - best_val_step >= config.early_stop_patience_steps:
+                        early_stop_triggered = True
+                        reduced_info["early_stop/triggered"] = 1
+                        reduced_info["early_stop/best_val_metric"] = best_val_metric
+                        reduced_info["early_stop/best_val_step"] = best_val_step
+                        logging.info(
+                            "Early stopping at step %d: %s did not improve for %d steps "
+                            "(best=%.6f at step %d).",
+                            step,
+                            config.early_stop_metric,
+                            step - best_val_step,
+                            best_val_metric,
+                            best_val_step,
+                        )
+            wandb_info = _core_wandb_metrics(reduced_info)
+            info_str = ", ".join(f"{k}={v:.4f}" for k, v in wandb_info.items())
             pbar.write(f"Step {step}: {info_str}, progress_target_sample0={progress_sample0_str}")
-            wandb.log(reduced_info, step=step)
+            if wandb_info:
+                wandb.log(wandb_info, step=step)
             infos = []
+        if early_stop_triggered:
+            _checkpoints.save_state(checkpoint_manager, train_state, data_loader, step)
+            break
         batch = next(data_iter)
 
         if (step % config.save_interval == 0 and step > start_step) or step == config.num_train_steps - 1:
@@ -491,5 +563,23 @@ def main(config: _config.TrainConfig):
     checkpoint_manager.wait_until_finished()
 
 
+@dataclasses.dataclass(frozen=True)
+class FewshotTrainConfig(_config.TrainConfig):
+    # Keep fewshot-only knobs out of the regular training config.
+    val_repo_id: str | None = None
+    early_stop_patience_steps: int = 0
+    early_stop_min_delta: float = 0.0
+    early_stop_metric: str = "val/loss"
+
+
+def _fewshot_cli() -> FewshotTrainConfig:
+    base_field_names = [field.name for field in dataclasses.fields(_config.TrainConfig)]
+    configs = {}
+    for name, config in _config._CONFIGS_DICT.items():
+        kwargs = {field_name: getattr(config, field_name) for field_name in base_field_names}
+        configs[name] = (name, FewshotTrainConfig(**kwargs))
+    return tyro.extras.overridable_config_cli(configs)
+
+
 if __name__ == "__main__":
-    main(_config.cli())
+    main(_fewshot_cli())

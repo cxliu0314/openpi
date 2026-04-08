@@ -145,55 +145,6 @@ def _extract_linear_params(module_params: dict, prefix: str) -> dict[str, torch.
     }
 
 
-def _extract_progress_head_params(
-    initial_params: dict,
-) -> dict[str, torch.Tensor] | None:
-    """Extract progress head params from JAX checkpoint, supporting both linear and MLP heads."""
-    projection_params = initial_params["projection_params"]
-    if "progress_out_proj" not in projection_params:
-        return None
-
-    progress_params = projection_params["progress_out_proj"]
-    if "kernel" in progress_params and "bias" in progress_params:
-        return _extract_linear_params(progress_params, "progress_out_proj")
-
-    result = {}
-    for layer_name in ("fc1", "fc2", "fc3"):
-        if layer_name not in progress_params:
-            raise ValueError(
-                "Unsupported progress head structure in checkpoint. "
-                f"Expected linear params or MLP layers fc1/fc2/fc3, got keys: {sorted(progress_params.keys())}"
-            )
-        result.update(_extract_linear_params(progress_params[layer_name], f"progress_out_proj.{layer_name}"))
-    return result
-
-
-def _extract_progress_module_state(
-    projection_params: dict,
-    module_key: str,
-) -> tuple[str, dict[str, torch.Tensor]] | None:
-    """Extract linear/MLP progress module to a plain state_dict."""
-    if module_key not in projection_params:
-        return None
-    module_params = projection_params[module_key]
-    if "kernel" in module_params and "bias" in module_params:
-        state = _extract_linear_params(module_params, "progress_out_proj")
-        plain = {k.removeprefix("progress_out_proj."): v for k, v in state.items()}
-        return "linear", plain
-
-    mlp_state = {}
-    for layer_name in ("fc1", "fc2", "fc3"):
-        if layer_name not in module_params:
-            raise ValueError(
-                f"Unsupported progress module `{module_key}`. "
-                f"Expected linear or fc1/fc2/fc3, got keys: {sorted(module_params.keys())}"
-            )
-        layer_state = _extract_linear_params(module_params[layer_name], f"progress_out_proj.{layer_name}")
-        for key, value in layer_state.items():
-            mlp_state[key.removeprefix("progress_out_proj.")] = value
-    return "mlp", mlp_state
-
-
 def _extract_chunk_progress_module_state(
     projection_params: dict,
     module_key: str,
@@ -230,24 +181,12 @@ def _infer_progress_variant(checkpoint_dir: str, projection_params: dict, progre
         return progress_variant
 
     exp_name = os.path.basename(os.path.dirname(checkpoint_dir.rstrip("/"))).lower()
-    if "chunk_progress_hybrid_concat" in exp_name:
-        return "chunk_hybrid_concat"
     if "chunk_progress_prefix" in exp_name:
         return "chunk_prefix"
-    if "chunk_progress_clean_suffix" in exp_name:
-        return "chunk_low_noise_action"
-    if "low_noise" in exp_name:
-        return "low_noise_action"
 
-    if "progress_chunk_hybrid_out_proj" in projection_params:
-        return "chunk_hybrid_concat"
-    if "progress_chunk_action_out_proj" in projection_params:
-        return "chunk_low_noise_action"
     if "progress_chunk_prefix_out_proj" in projection_params:
         return "chunk_prefix"
-    if "progress_out_proj_action" in projection_params:
-        return "low_noise_action"
-    return "prefix"
+    return "chunk_prefix"
 
 
 def _extract_progress_payload(
@@ -257,26 +196,22 @@ def _extract_progress_payload(
 ) -> tuple[dict[str, torch.Tensor] | None, dict[str, object] | None]:
     """
     Returns:
-      base_progress_params: progress_out_proj params used for PI0Pytorch load (if present)
+      base_progress_params: no longer used; kept as None for converter compatibility
       progress_payload: standalone progress_head.pt payload with metadata + state_dict
     """
     projection_params = initial_params["projection_params"]
-    base_progress_params = _extract_progress_head_params(initial_params)
+    base_progress_params = None
 
     selected_variant = _infer_progress_variant(checkpoint_dir, projection_params, progress_variant)
     variant_map = {
-        "prefix": ("progress_out_proj", "prefix", False),
-        "low_noise_action": ("progress_out_proj_action", "low_noise_action", False),
-        "chunk_prefix": ("progress_chunk_prefix_out_proj", "chunk_prefix", True),
-        "chunk_low_noise_action": ("progress_chunk_action_out_proj", "chunk_low_noise_action", True),
-        "chunk_hybrid_concat": ("progress_chunk_hybrid_out_proj", "chunk_hybrid_concat", True),
+        "chunk_prefix": ("progress_chunk_prefix_out_proj", "chunk_prefix", "chunk"),
     }
-    module_key, readout_mode, is_chunk = variant_map[selected_variant]
+    module_key, readout_mode, module_type = variant_map[selected_variant]
 
-    if is_chunk:
+    if module_type == "chunk":
         extracted = _extract_chunk_progress_module_state(projection_params, module_key)
     else:
-        extracted = _extract_progress_module_state(projection_params, module_key)
+        raise ValueError(f"Unsupported progress module type: {module_type}")
     if extracted is None:
         return base_progress_params, None
     head_type, state_dict = extracted
@@ -357,14 +292,7 @@ def convert_pi0_checkpoint_lora_aware(
     output_path: str,
     model_config: openpi.models.pi0_config.Pi0Config,
     progress_head_filename: str = "progress_head.pt",
-    progress_variant: Literal[
-        "auto",
-        "prefix",
-        "low_noise_action",
-        "chunk_prefix",
-        "chunk_low_noise_action",
-        "chunk_hybrid_concat",
-    ] = "auto",
+    progress_variant: Literal["auto", "chunk_prefix"] = "auto",
 ) -> None:
     print(f"[LoRA-aware] Converting from: {checkpoint_dir}")
     print(f"[LoRA-aware] Output path: {output_path}")
@@ -391,9 +319,9 @@ def convert_pi0_checkpoint_lora_aware(
         initial_params, checkpoint_dir=checkpoint_dir, progress_variant=progress_variant
     )
     if progress_params is None:
-        print("[LoRA-aware+Progress] No `progress_out_proj` found in checkpoint (base model load skips it).")
+        print("[LoRA-aware+Progress] No chunk-prefix progress params found for base model load.")
     else:
-        print("[LoRA-aware+Progress] Found `progress_out_proj` for base model load.")
+        print("[LoRA-aware+Progress] Found chunk-prefix progress params for base model load.")
     if progress_payload is None:
         print("[LoRA-aware+Progress] No standalone progress payload extracted.")
     else:
@@ -447,15 +375,15 @@ def convert_pi0_checkpoint_lora_aware(
     pi0_model = openpi.models_pytorch.pi0_pytorch.PI0Pytorch(model_config)
     all_params = {**paligemma_params, **gemma_params, **projection_params}
     supports_progress_module = (
-        hasattr(pi0_model, "progress_out_proj")
-        and getattr(pi0_model, "progress_out_proj") is not None
+        hasattr(pi0_model, "progress_chunk_prefix_out_proj")
+        and getattr(pi0_model, "progress_chunk_prefix_out_proj") is not None
     )
     if progress_params is not None and supports_progress_module:
-        # Also load into full model when model architecture includes progress_out_proj.
+        # Also load into full model when model architecture includes the chunk-prefix progress head.
         all_params.update(progress_params)
     elif progress_params is not None:
         print(
-            "[LoRA-aware+Progress] PI0Pytorch in current env has no progress_out_proj; "
+            "[LoRA-aware+Progress] PI0Pytorch in current env has no chunk-prefix progress module; "
             "keep progress head as standalone checkpoint only."
         )
     msg = pi0_model.load_state_dict(all_params, strict=False)
@@ -524,14 +452,7 @@ def main(
     output_path: str | None = None,
     precision: Literal["float32", "bfloat16", "float16"] = "bfloat16",
     progress_head_filename: str = "progress_head.pt",
-    progress_variant: Literal[
-        "auto",
-        "prefix",
-        "low_noise_action",
-        "chunk_prefix",
-        "chunk_low_noise_action",
-        "chunk_hybrid_concat",
-    ] = "auto",
+    progress_variant: Literal["auto", "chunk_prefix"] = "auto",
     *,
     inspect_only: bool = False,
 ):

@@ -298,8 +298,6 @@ class Block(nn.Module):
         attn_mask,
         adarms_cond,
         deterministic=True,
-        capture_flag=False,
-        prefix_mask=None,
     ):  # noqa: FBT002
         xs = sharding.activation_sharding_constraint(xs)
         drop = nn.Dropout(self.dropout, self.dropout_bdims) if self.dropout else lambda x, _: x
@@ -340,15 +338,7 @@ class Block(nn.Module):
         xs = [_gated_residual(x, y, gate) for x, y, gate in zip(xs, out, gates, strict=True)]
         xs = sharding.activation_sharding_constraint(xs)
 
-        dtype = next((x.dtype for x in xs if x is not None), jnp.float32)
-        pooled_capture = jax.lax.cond(
-            jnp.asarray(capture_flag, dtype=jnp.bool_),
-            lambda _: _pool_prefix_capture(xs[0], prefix_mask, self.configs[0].width, dtype),
-            lambda _: jnp.zeros((prefix_mask.shape[0], self.configs[0].width), dtype=dtype),
-            operand=None,
-        )
-
-        return xs, (kv_cache, pooled_capture)
+        return xs, kv_cache
 
 
 KVCache: TypeAlias = tuple[at.Float[at.Array, "l b _t _k _h"], at.Float[at.Array, "l b _t _v _h"]]
@@ -390,9 +380,7 @@ class Module(nn.Module):
                 nn.broadcast,
                 nn.broadcast,
                 nn.broadcast,
-                0,
-                nn.broadcast,
-            ),  # 0=kv_cache, 1=positions, 2=mask, 3=adarms_cond, 4=deterministic, 5=capture_flag, 6=prefix_mask
+            ),  # 0=kv_cache, 1=positions, 2=mask, 3=adarms_cond, 4=deterministic
             length=self.configs[0].depth,
         )(
             configs=self.configs,
@@ -422,50 +410,13 @@ class Module(nn.Module):
         if adarms_cond is None:
             adarms_cond = [None] * len(self.configs)
 
-        prefix_mask = _default_prefix_mask(embedded)
-        capture_flags = jnp.zeros((self.configs[0].depth,), dtype=jnp.bool_)
-        embedded, (kv_cache, _pooled_prefix_captures) = self.layers(
-            embedded, kv_cache, positions, mask, adarms_cond, deterministic, capture_flags, prefix_mask
-        )
+        embedded, kv_cache = self.layers(embedded, kv_cache, positions, mask, adarms_cond, deterministic)
 
         assert all(e.dtype == jnp.dtype(self.embed_dtype) for e in embedded if e is not None)
 
         return [
             f(e, a)[0] if e is not None else e for f, e, a in zip(self.final_norms, embedded, adarms_cond, strict=True)
         ], kv_cache
-
-    @at.typecheck
-    def forward_with_pooled_prefix_captures(
-        self,
-        embedded: Sequence[at.Float[at.Array, "b _t _d"] | None],
-        positions: at.Int[at.Array, "b t"],
-        mask: at.Bool[at.Array, "b t s"],
-        prefix_mask: at.Bool[at.Array, "b p"],
-        capture_layer_indices: Sequence[int],
-        adarms_cond: Sequence[at.Float[at.Array, "b _d"] | None] | None = None,
-        *,
-        kv_cache: KVCache | None = None,
-        deterministic: bool = True,
-    ) -> tuple[Sequence[at.Float[at.Array, "b _t _d"] | None], tuple[at.Float[at.Array, "b _d"], ...], KVCache]:
-        embedded = jax.tree.map(lambda e: e.astype(self.embed_dtype), embedded)
-        mask = jnp.asarray(mask)[:, None, :, :]
-        if adarms_cond is None:
-            adarms_cond = [None] * len(self.configs)
-
-        capture_flags = jnp.zeros((self.configs[0].depth,), dtype=jnp.bool_)
-        if capture_layer_indices:
-            capture_flags = capture_flags.at[jnp.asarray(tuple(capture_layer_indices), dtype=jnp.int32)].set(True)
-        embedded, (kv_cache, pooled_prefix_captures) = self.layers(
-            embedded, kv_cache, positions, mask, adarms_cond, deterministic, capture_flags, prefix_mask
-        )
-
-        assert all(e.dtype == jnp.dtype(self.embed_dtype) for e in embedded if e is not None)
-
-        outputs = [
-            f(e, a)[0] if e is not None else e for f, e, a in zip(self.final_norms, embedded, adarms_cond, strict=True)
-        ]
-        selected_captures = tuple(pooled_prefix_captures[int(i)] for i in capture_layer_indices)
-        return outputs, selected_captures, kv_cache
 
     def init(self, use_adarms: Sequence[bool]):
         """Convenience method for initializing all parameters, necessary due to the quirks of linen."""
@@ -476,23 +427,6 @@ class Module(nn.Module):
             jnp.zeros((1, len(self.configs), len(self.configs)), dtype=bool),
             adarms_cond=[jnp.zeros((1, c.width)) if u else None for u, c in zip(use_adarms, self.configs, strict=True)],
         )
-
-
-def _default_prefix_mask(embedded: Sequence[at.Float[at.Array, "b _t _d"] | None]) -> at.Bool[at.Array, "b p"]:
-    prefix = embedded[0]
-    if prefix is None:
-        batch_size = next((x.shape[0] for x in embedded if x is not None), 1)
-        return jnp.zeros((batch_size, 1), dtype=jnp.bool_)
-    return jnp.ones(prefix.shape[:2], dtype=jnp.bool_)
-
-
-def _pool_prefix_capture(prefix_hidden, prefix_mask, width: int, dtype):
-    if prefix_hidden is None:
-        return jnp.zeros((prefix_mask.shape[0], width), dtype=dtype)
-    weights = prefix_mask.astype(jnp.float32)[..., None]
-    denom = jnp.maximum(jnp.sum(weights, axis=1), 1.0)
-    pooled = jnp.sum(prefix_hidden.astype(jnp.float32) * weights, axis=1) / denom
-    return pooled.astype(prefix_hidden.dtype)
 
 
 def _apply_rope(x, *, positions, max_wavelength=10_000):

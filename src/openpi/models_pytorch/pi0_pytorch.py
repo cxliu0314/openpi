@@ -10,6 +10,10 @@ import openpi.models.gemma as _gemma
 from openpi.models_pytorch.gemma_pytorch import PaliGemmaWithExpertModel
 import openpi.models_pytorch.preprocessing_pytorch as _preprocessing
 
+CHUNK_PROGRESS_ADAPTER_DIM = 1024
+CHUNK_PROGRESS_HIDDEN_DIM = 512
+CHUNK_PROGRESS_MID_DIM = 128
+
 
 def get_safe_dtype(target_dtype, device_type):
     """Get a safe dtype for the given device type."""
@@ -68,6 +72,28 @@ class ProgressHead(nn.Module):
         return torch.sigmoid(x.squeeze(-1))
 
 
+class ChunkProgressHead(nn.Module):
+    def __init__(
+        self,
+        input_dim: int,
+        adapter_dim: int = CHUNK_PROGRESS_ADAPTER_DIM,
+        hidden_dim: int = CHUNK_PROGRESS_HIDDEN_DIM,
+        mid_dim: int = CHUNK_PROGRESS_MID_DIM,
+    ):
+        super().__init__()
+        self.input_adapter = nn.Linear(input_dim, adapter_dim)
+        self.shared_head = ProgressHead(adapter_dim, hidden_dim=hidden_dim, mid_dim=mid_dim)
+
+    def adapt_inputs(self, hidden_states: Tensor) -> Tensor:
+        return self.input_adapter(hidden_states)
+
+    def predict_from_adapted(self, adapted_hidden_states: Tensor) -> Tensor:
+        return self.shared_head.predict_progress(adapted_hidden_states)
+
+    def predict_progress(self, hidden_states: Tensor) -> Tensor:
+        return self.predict_from_adapted(self.adapt_inputs(hidden_states))
+
+
 def make_att_2d_masks(pad_masks, att_masks):
     """Copied from big_vision.
 
@@ -119,8 +145,9 @@ class PI0Pytorch(nn.Module):
         self.action_in_proj = nn.Linear(config.action_dim, action_expert_config.width)
         self.action_out_proj = nn.Linear(action_expert_config.width, config.action_dim)
         self.enable_progress_head = bool(getattr(config, "enable_progress_head", self.pi05))
-        self.progress_out_proj = ProgressHead(paligemma_config.width) if self.enable_progress_head else None
-        self.progress_out_proj_action = ProgressHead(action_expert_config.width) if self.enable_progress_head else None
+        self.progress_chunk_prefix_out_proj = (
+            ChunkProgressHead(paligemma_config.width) if self.enable_progress_head else None
+        )
 
         if self.pi05:
             self.time_mlp_in = nn.Linear(action_expert_config.width, action_expert_config.width)
@@ -417,7 +444,7 @@ class PI0Pytorch(nn.Module):
         v_t = self._apply_checkpoint(action_out_proj_func, suffix_out)
         return F.mse_loss(u_t, v_t, reduction="none")
 
-    def compute_action_and_progress(self, observation, actions, noise=None, time=None):
+    def compute_action_and_progress_chunk_prefix(self, observation, actions, noise=None, time=None):
         u_t, prefix_out, prefix_pad_masks, suffix_out = self._forward_action_tokens(
             observation, actions, noise=noise, time=time
         )
@@ -428,53 +455,25 @@ class PI0Pytorch(nn.Module):
         v_t = self._apply_checkpoint(action_out_proj_func, suffix_out)
         chunked_loss = F.mse_loss(u_t, v_t, reduction="none").mean(dim=-1)
 
-        if not self.enable_progress_head or self.progress_out_proj is None:
+        if not self.enable_progress_head or self.progress_chunk_prefix_out_proj is None:
             return chunked_loss, None
 
         progress_feature = self._pool_prefix_features(prefix_out, prefix_pad_masks)
-        progress_pred = self.progress_out_proj.predict_progress(progress_feature)
-        return chunked_loss, progress_pred
-
-    def compute_action_and_progress_low_noise(self, observation, actions, noise=None, time=None, progress_t=0.001):
-        images, img_masks, lang_tokens, lang_masks, state = self._preprocess_observation(observation, train=True)
-
-        if noise is None:
-            noise = self.sample_noise(actions.shape, actions.device)
-
-        if time is None:
-            time = self.sample_time(actions.shape[0], actions.device)
-
-        time_expanded = time[:, None, None]
-        x_t = time_expanded * noise + (1 - time_expanded) * actions
-        u_t = noise - actions
-
-        prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(images, img_masks, lang_tokens, lang_masks)
-        _prefix_out, suffix_out = self._encode_suffix_tokens(
-            prefix_embs, prefix_pad_masks, prefix_att_masks, state, x_t, time
+        adapted_prefix = self.progress_chunk_prefix_out_proj.adapt_inputs(progress_feature)
+        if self.config.action_horizon == 1:
+            positions = torch.zeros((1,), dtype=torch.float32, device=adapted_prefix.device)
+        else:
+            positions = torch.linspace(0.0, 1.0, self.config.action_horizon, dtype=torch.float32, device=adapted_prefix.device)
+        step_embedding = create_sinusoidal_pos_embedding(
+            positions,
+            adapted_prefix.shape[-1],
+            min_period=4e-3,
+            max_period=4.0,
+            device=adapted_prefix.device,
+        ).to(dtype=adapted_prefix.dtype)
+        progress_pred = self.progress_chunk_prefix_out_proj.predict_from_adapted(
+            adapted_prefix[:, None, :] + step_embedding[None, :, :]
         )
-
-        def action_out_proj_func(suffix_out):
-            return self.action_out_proj(suffix_out)
-
-        v_t = self._apply_checkpoint(action_out_proj_func, suffix_out)
-        chunked_loss = F.mse_loss(u_t, v_t, reduction="none").mean(dim=-1)
-
-        if not self.enable_progress_head or self.progress_out_proj_action is None:
-            return chunked_loss, None
-
-        progress_time = torch.full(
-            (actions.shape[0],),
-            float(progress_t),
-            dtype=actions.dtype,
-            device=actions.device,
-        )
-        progress_time_expanded = progress_time[:, None, None]
-        clean_actions = (1 - progress_time_expanded) * actions
-        _progress_prefix_out, progress_suffix_out = self._encode_suffix_tokens(
-            prefix_embs, prefix_pad_masks, prefix_att_masks, state, clean_actions, progress_time
-        )
-        progress_feature = progress_suffix_out[:, 0, :]
-        progress_pred = self.progress_out_proj_action.predict_progress(progress_feature)
         return chunked_loss, progress_pred
 
     @torch.no_grad()

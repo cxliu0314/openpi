@@ -81,7 +81,25 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Regenerate existing videos.",
     )
+    parser.add_argument(
+        "--spread-evenly",
+        action="store_true",
+        help="Ignore --sample-every and sample up to --max-episodes evenly across the split.",
+    )
     return parser.parse_args()
+
+
+def evenly_spaced_indices(total_episodes: int, max_episodes: int) -> list[int]:
+    if total_episodes <= 0 or max_episodes <= 0:
+        return []
+    if total_episodes <= max_episodes:
+        return list(range(total_episodes))
+    if max_episodes == 1:
+        return [0]
+    return [
+        (i * (total_episodes - 1)) // (max_episodes - 1)
+        for i in range(max_episodes)
+    ]
 
 
 def count_dataset_infos(path: Path) -> int:
@@ -141,13 +159,19 @@ def export_dataset(root: Path, args: argparse.Namespace) -> dict:
     if args.sample_every <= 0:
         raise ValueError("--sample-every must be positive")
 
-    sampled_indices = list(range(0, total_episodes, args.sample_every))
-    if args.max_episodes > 0:
-        sampled_indices = sampled_indices[: args.max_episodes]
+    if args.spread_evenly:
+        sampled_indices = evenly_spaced_indices(total_episodes, args.max_episodes)
+        sampling_mode = "spread_evenly"
+    else:
+        sampled_indices = list(range(0, total_episodes, args.sample_every))
+        if args.max_episodes > 0:
+            sampled_indices = sampled_indices[: args.max_episodes]
+        sampling_mode = "stride"
 
     print(
         f"[dataset] root={root} resolved={builder.info.name}:{builder.info.version} "
-        f"sampled={len(sampled_indices)} total={total_episodes} stride={args.sample_every}",
+        f"sampled={len(sampled_indices)} total={total_episodes} "
+        f"mode={sampling_mode} stride={args.sample_every}",
         flush=True,
     )
 
@@ -184,7 +208,11 @@ def export_dataset(root: Path, args: argparse.Namespace) -> dict:
     return {
         "dataset_root": str(root),
         "resolved_name": f"{builder.info.name}:{builder.info.version}",
+        "total_episodes": total_episodes,
         "exported": len(records),
+        "requested_max_episodes": args.max_episodes,
+        "requested_sample_count": len(sampled_indices),
+        "sampling_mode": sampling_mode,
         "sample_every": args.sample_every,
         "sampled_episode_indices": sampled_indices[: len(records)],
         "vis_dir": str(vis_dir),

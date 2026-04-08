@@ -70,10 +70,10 @@ def init_logging():
 
 
 def _compute_action_and_progress_with_mode(model, config: _config.TrainConfig, observation, actions):
-    if config.progress_readout_mode == "low_noise_action" and hasattr(model, "compute_action_and_progress_low_noise"):
-        return model.compute_action_and_progress_low_noise(observation, actions)
-    if hasattr(model, "compute_action_and_progress"):
-        return model.compute_action_and_progress(observation, actions)
+    if config.progress_readout_mode != "chunk_prefix":
+        raise ValueError(f"Only chunk_prefix progress readout is supported, got: {config.progress_readout_mode}")
+    if hasattr(model, "compute_action_and_progress_chunk_prefix"):
+        return model.compute_action_and_progress_chunk_prefix(observation, actions)
 
     raw_loss = model(observation, actions)
     if isinstance(raw_loss, list | tuple):

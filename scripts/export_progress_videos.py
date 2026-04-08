@@ -190,7 +190,7 @@ def _resolve_config_spec(config_name: str) -> ConfigSpec:
             repo_id="modified_libero_lerobot_split_padded/libero_10_no_noops",
             prompt_from_task=True,
             action_horizon=10,
-            progress_target_mode="scalar",
+            progress_target_mode="chunk",
         )
     raise ValueError(
         f"Unsupported config_name={config_name!r}. "
@@ -467,7 +467,7 @@ def _annotate_frame(
     pad_mask_str = "".join("1" if value else "0" for value in step.actions_is_pad.tolist())
     lines = [
         (
-            f"config_progress_mode=scalar | action_horizon={episode.steps[0].progress_chunk.shape[0]} "
+            f"config_progress_mode=chunk | action_horizon={episode.steps[0].progress_chunk.shape[0]} "
             f"chunk-preview "
             f"| scalar_formula_err={step.formula_error:.6f}"
         ),
