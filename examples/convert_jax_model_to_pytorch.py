@@ -532,13 +532,26 @@ def convert_pi0_checkpoint(
     # Save model weights as SafeTensors using save_model to handle tied weights
     safetensors.torch.save_model(pi0_model, os.path.join(output_path, "model.safetensors"))
 
-    # Copy assets folder if it exists
-    assets_source = pathlib.Path(checkpoint_dir).parent / "assets"
+    # Copy assets folder if it exists.
+    # NOTE:
+    # - For step checkpoints, assets live in <checkpoint_dir>/assets
+    # - For older layouts, assets may live in <checkpoint_dir>/../assets
+    assets_source = pathlib.Path(checkpoint_dir) / "assets"
+    if not assets_source.exists():
+        assets_source = pathlib.Path(checkpoint_dir).parent / "assets"
     if assets_source.exists():
         assets_dest = pathlib.Path(output_path) / "assets"
         if assets_dest.exists():
             shutil.rmtree(assets_dest)
         shutil.copytree(assets_source, assets_dest)
+
+        # Also materialize root-level <asset_id>/norm_stats.json expected by RLinf/OpenPI loader.
+        # We keep assets/... and add the stripped path for compatibility.
+        for norm_path in assets_dest.rglob("norm_stats.json"):
+            rel = norm_path.relative_to(assets_dest)  # e.g. libero_xxx/.../norm_stats.json
+            root_norm = pathlib.Path(output_path) / rel
+            root_norm.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(norm_path, root_norm)
 
     # Save config as JSON for reference
     config_dict = {

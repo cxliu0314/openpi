@@ -520,7 +520,11 @@ def main(config: _config.TrainConfig):
                 reduced_info.update(reduced_val_info)
                 val_ran = True
             reduced_info = _add_canonical_loss_metrics(reduced_info)
-            if val_ran and config.early_stop_patience_steps > 0:
+            if (
+                val_ran
+                and config.early_stop_patience_steps > 0
+                and step >= config.early_stop_min_train_steps
+            ):
                 monitor_raw = reduced_info.get(config.early_stop_metric)
                 if monitor_raw is None and config.early_stop_metric == "val/loss":
                     monitor_raw = reduced_info.get("val/total_loss")
@@ -568,6 +572,7 @@ class FewshotTrainConfig(_config.TrainConfig):
     # Keep fewshot-only knobs out of the regular training config.
     val_repo_id: str | None = None
     early_stop_patience_steps: int = 0
+    early_stop_min_train_steps: int = 0
     early_stop_min_delta: float = 0.0
     early_stop_metric: str = "val/loss"
 

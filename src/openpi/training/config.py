@@ -23,6 +23,7 @@ import openpi.policies.libero_policy as libero_policy
 import openpi.shared.download as _download
 import openpi.shared.normalize as _normalize
 import openpi.training.droid_rlds_dataset as droid_rlds_dataset
+import openpi.training.rlds_pi05_dataset as rlds_pi05_dataset
 import openpi.training.misc.polaris_config as polaris_config
 import openpi.training.misc.roboarena_config as roboarena_config
 import openpi.training.optimizer as _optimizer
@@ -92,10 +93,12 @@ class DataConfig:
 
     # Only used for RLDS data loader (ie currently only used for DROID).
     rlds_data_dir: str | None = None
+    # RLDS adapter kind for pi0.5 unified RLDS loading.
+    adapter_kind: str | None = None
     # Action space for DROID dataset.
     action_space: droid_rlds_dataset.DroidActionSpace | None = None
     # List of datasets to sample from: name, version, weight, and optionally filter_dict_path
-    datasets: Sequence[droid_rlds_dataset.RLDSDataset] = ()
+    datasets: Sequence[Any] = ()
 
 
 class GroupFactory(Protocol):
@@ -279,6 +282,69 @@ class LeRobotAlohaDataConfig(DataConfigFactory):
 
 
 @dataclasses.dataclass(frozen=True)
+class LeRobotFrankaDualDataConfig(DataConfigFactory):
+    """Franka dual-arm LeRobot layout (7+1+7+1 = 16D)."""
+
+    use_delta_joint_actions: bool = True
+    default_prompt: str | None = None
+    adapt_to_pi: bool = False
+    # DoF of robot actions in dataset/env (e.g. 8 for single-arm, 16 for dual-arm).
+    robot_action_dim: int = 16
+
+    repack_transforms: tyro.conf.Suppress[_transforms.Group] = dataclasses.field(
+        default=_transforms.Group(
+            inputs=[
+                _transforms.RepackTransform(
+                    {
+                        "images": {
+                            "cam_high": "observation.images.cam_high",
+                            "cam_left_wrist": "observation.images.cam_left_wrist",
+                            "cam_right_wrist": "observation.images.cam_right_wrist",
+                        },
+                        "state": "observation.state",
+                        "actions": "action",
+                        "prompt": "prompt",
+                        "frame_index": "frame_index",
+                        "episode_len": "episode_len",
+                    }
+                )
+            ]
+        )
+    )
+    action_sequence_keys: Sequence[str] = ("action",)
+
+    @override
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        data_transforms = _transforms.Group(
+            inputs=[aloha_policy.AlohaInputs(adapt_to_pi=self.adapt_to_pi)],
+            outputs=[aloha_policy.AlohaOutputs(adapt_to_pi=self.adapt_to_pi, action_dim=self.robot_action_dim)],
+        )
+        if self.use_delta_joint_actions:
+            if self.robot_action_dim >= 16:
+                delta_action_mask = _transforms.make_bool_mask(7, -1, 7, -1)
+            elif self.robot_action_dim >= 8:
+                delta_action_mask = _transforms.make_bool_mask(7, -1)
+            else:
+                raise ValueError(f"Unsupported robot_action_dim={self.robot_action_dim}, expected >= 8")
+            data_transforms = data_transforms.push(
+                inputs=[_transforms.DeltaActions(delta_action_mask)],
+                outputs=[_transforms.AbsoluteActions(delta_action_mask)],
+            )
+
+        model_transforms = ModelTransformFactory(default_prompt=self.default_prompt)(model_config)
+
+        return dataclasses.replace(
+            self.create_base_config(assets_dirs, model_config),
+            repack_transforms=self.repack_transforms,
+            data_transforms=data_transforms,
+            model_transforms=model_transforms,
+            action_sequence_keys=self.action_sequence_keys,
+            # Avoid quantile explosion on near-constant gripper dims.
+            use_quantile_norm=False,
+        )
+
+
+@dataclasses.dataclass(frozen=True)
 class LeRobotLiberoDataConfig(DataConfigFactory):
     """
     This config is used to configure transforms that are applied at various parts of the data pipeline.
@@ -422,6 +488,65 @@ class RLDSDroidDataConfig(DataConfigFactory):
             model_transforms=model_transforms,
             rlds_data_dir=self.rlds_data_dir,
             action_space=self.action_space,
+            datasets=self.datasets,
+        )
+
+
+@dataclasses.dataclass(frozen=True)
+class RLDSPi05LiberoStyleDataConfig(DataConfigFactory):
+    """RLDS loader config that standardizes data to the pi0.5 LIBERO format."""
+
+    rlds_data_dir: str | None = None
+    adapter_kind: rlds_pi05_dataset.Pi05RLDSAdapterKind = rlds_pi05_dataset.Pi05RLDSAdapterKind.LIBERO
+    datasets: Sequence[rlds_pi05_dataset.RLDSDatasetSpec] = ()
+    extra_delta_transform: bool = False
+
+    @override
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        repack_structure: dict[str, Any] = {
+            "observation/image": "image",
+            "observation/wrist_image": "wrist_image",
+            "observation/state": "state",
+            "actions": "actions",
+            "prompt": "prompt",
+            "frame_index": "frame_index",
+            "episode_index": "episode_index",
+            "episode_len": "episode_len",
+        }
+        if self.adapter_kind == rlds_pi05_dataset.Pi05RLDSAdapterKind.DROID_OBS_EEF_DELTA:
+            repack_structure["step_id"] = "step_id"
+
+        repack_transform = _transforms.Group(
+            inputs=[
+                _transforms.RepackTransform(
+                    repack_structure
+                )
+            ]
+        )
+
+        data_transforms = _transforms.Group(
+            inputs=[libero_policy.LiberoInputs(model_type=model_config.model_type)],
+            outputs=[libero_policy.LiberoOutputs()],
+        )
+
+        if self.extra_delta_transform:
+            delta_action_mask = _transforms.make_bool_mask(6, -1)
+            data_transforms = data_transforms.push(
+                inputs=[_transforms.DeltaActions(delta_action_mask)],
+                outputs=[_transforms.AbsoluteActions(delta_action_mask)],
+            )
+
+        model_transforms = ModelTransformFactory()(model_config)
+
+        assert self.rlds_data_dir is not None, "Need to set rlds data dir for unified RLDS data loader."
+
+        return dataclasses.replace(
+            self.create_base_config(assets_dirs, model_config),
+            repack_transforms=repack_transform,
+            data_transforms=data_transforms,
+            model_transforms=model_transforms,
+            rlds_data_dir=self.rlds_data_dir,
+            adapter_kind=self.adapter_kind.value,
             datasets=self.datasets,
         )
 
@@ -785,6 +910,26 @@ _CONFIGS = [
         ema_decay=None,
     ),
     TrainConfig(
+        name="pi05_franka_full_base",
+        model=pi0_config.Pi0Config(pi05=True, action_dim=32, action_horizon=10, discrete_state_input=False),
+        data=LeRobotFrankaDualDataConfig(
+            repo_id="robotwin_9tasks_0331_split",
+            base_config=DataConfig(prompt_from_task=True),
+            robot_action_dim=8,
+        ),
+        batch_size=256,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=10_000,
+            peak_lr=5e-5,
+            decay_steps=1_000_000,
+            decay_lr=5e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        weight_loader=weight_loaders.CheckpointWeightLoader("/data/Embobrain/modelsrepo/pi05_base/params"),
+        num_train_steps=30_000,
+    ),
+    TrainConfig(
         name="pi05_libero",
         model=pi0_config.Pi0Config(pi05=True, action_horizon=10, discrete_state_input=False),
         data=LeRobotLiberoDataConfig(
@@ -871,6 +1016,75 @@ _CONFIGS = [
         weight_loader=weight_loaders.CheckpointWeightLoader(
             "/data/Embobrain/openpi/checkpoints/pi05_libero_lora/libero_lora_finetune_256/29999/params"
         ),
+        freeze_filter=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=10,
+            discrete_state_input=False,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ).get_freeze_filter(),
+        num_train_steps=30_000,
+    ),
+    TrainConfig(
+        name="pi05_rlds_libero_uni",
+        model=pi0_config.Pi0Config(pi05=True, action_horizon=10, discrete_state_input=False),
+        data=RLDSPi05LiberoStyleDataConfig(
+            repo_id="rlds_pi05_uni_libero_10_no_noops",
+            assets=AssetsConfig(asset_id="rlds_pi05_uni_libero_10_no_noops"),
+            rlds_data_dir="/data/Embobrain/dataset_revised/libero/libero_10_split_padded",
+            adapter_kind=rlds_pi05_dataset.Pi05RLDSAdapterKind.LIBERO,
+            datasets=(
+                rlds_pi05_dataset.RLDSDatasetSpec(
+                    name="libero_10_no_noops",
+                    version="1.0.0",
+                    weight=1.0,
+                ),
+            ),
+        ),
+        batch_size=256,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=10_000,
+            peak_lr=5e-5,
+            decay_steps=1_000_000,
+            decay_lr=5e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        weight_loader=weight_loaders.CheckpointWeightLoader("/data/Embobrain/modelsrepo/pi05_base/params"),
+        num_train_steps=30_000,
+    ),
+    TrainConfig(
+        name="pi05_rlds_libero_lora_uni",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=10,
+            discrete_state_input=False,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ),
+        data=RLDSPi05LiberoStyleDataConfig(
+            repo_id="rlds_pi05_uni_libero_10_no_noops",
+            assets=AssetsConfig(asset_id="rlds_pi05_uni_libero_10_no_noops"),
+            rlds_data_dir="/data/Embobrain/dataset_revised/libero/libero_10_split_padded",
+            adapter_kind=rlds_pi05_dataset.Pi05RLDSAdapterKind.LIBERO,
+            datasets=(
+                rlds_pi05_dataset.RLDSDatasetSpec(
+                    name="libero_10_no_noops",
+                    version="1.0.0",
+                    weight=1.0,
+                ),
+            ),
+        ),
+        batch_size=256,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=10_000,
+            peak_lr=5e-5,
+            decay_steps=1_000_000,
+            decay_lr=5e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=None,
+        weight_loader=weight_loaders.CheckpointWeightLoader("/data/Embobrain/modelsrepo/pi05_base/params"),
         freeze_filter=pi0_config.Pi0Config(
             pi05=True,
             action_horizon=10,
@@ -1055,6 +1269,40 @@ _CONFIGS = [
         save_interval=5000,
         keep_period=10_000,
         num_workers=0,  # Important: RLDS DataLoader requires num_workers=0, handles multi-processing internally
+    ),
+    TrainConfig(
+        name="pi05_rlds_droid_full_uni",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_dim=32,
+            action_horizon=10,
+        ),
+        data=RLDSPi05LiberoStyleDataConfig(
+            repo_id="rlds_pi05_uni_droid_obs_eef_delta",
+            assets=AssetsConfig(asset_id="rlds_pi05_uni_droid_obs_eef_delta"),
+            rlds_data_dir="/data/Embobrain/dataset_revised/droid/droid_rlds_split_padded",
+            adapter_kind=rlds_pi05_dataset.Pi05RLDSAdapterKind.DROID_OBS_EEF_DELTA,
+            datasets=(
+                rlds_pi05_dataset.RLDSDatasetSpec(
+                    name="droid",
+                    version="0.0.1",
+                    weight=1.0,
+                ),
+            ),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("/data/Embobrain/modelsrepo/pi05_base/params"),
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=5e-5,
+            decay_steps=1_000_000,
+            decay_lr=5e-5,
+        ),
+        num_train_steps=100_000,
+        batch_size=256,
+        log_interval=100,
+        save_interval=5000,
+        keep_period=10_000,
+        num_workers=0,
     ),
     TrainConfig(
         # This config is for fine-tuning pi05-DROID on a custom (smaller) DROID dataset.

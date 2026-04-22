@@ -17,6 +17,7 @@ import openpi.models.model as _model
 import openpi.shared.array_typing as at
 import openpi.training.config as _config
 from openpi.training.droid_rlds_dataset import DroidRldsDataset
+from openpi.training.rlds_pi05_dataset import Pi05RldsDataset
 import openpi.transforms as _transforms
 
 T_co = TypeVar("T_co", covariant=True)
@@ -147,6 +148,17 @@ class FakeDataset(Dataset):
         return self._num_samples
 
 
+def _drop_non_numeric_fields(batch: dict) -> dict:
+    batch = dict(batch)
+    for key in list(batch.keys()):
+        if isinstance(batch[key], dict):
+            continue
+        dtype = np.asarray(batch[key]).dtype
+        if dtype.kind in {"O", "S", "U"}:
+            batch.pop(key)
+    return batch
+
+
 def create_torch_dataset(
     data_config: _config.DataConfig, action_horizon: int, model_config: _model.BaseModelConfig
 ) -> Dataset:
@@ -163,6 +175,9 @@ def create_torch_dataset(
         delta_timestamps={
             key: [t / dataset_meta.fps for t in range(action_horizon)] for key in data_config.action_sequence_keys
         },
+        # TorchCodec wheels can be ABI-sensitive on some clusters. Default to
+        # pyav for robust decoding; override with OPENPI_LEROBOT_VIDEO_BACKEND.
+        video_backend=os.environ.get("OPENPI_LEROBOT_VIDEO_BACKEND", "pyav"),
     )
 
     if hasattr(dataset, "episode_data_index"):
@@ -186,7 +201,16 @@ def create_rlds_dataset(
     *,
     shuffle: bool = False,
 ) -> Dataset:
-    # At the moment, we only support DROID for RLDS datasets.
+    if data_config.adapter_kind is not None:
+        return Pi05RldsDataset(
+            data_dir=data_config.rlds_data_dir,
+            batch_size=batch_size,
+            shuffle=shuffle,
+            action_chunk_size=action_horizon,
+            adapter_kind=data_config.adapter_kind,
+            datasets=data_config.datasets,
+        )
+
     return DroidRldsDataset(
         data_dir=data_config.rlds_data_dir,
         batch_size=batch_size,
@@ -514,6 +538,7 @@ class TorchDataLoader:
                 )
                 batch["progress_target"] = progress_target
                 batch["episode_hash"] = episode_hash
+                batch = _drop_non_numeric_fields(batch)
                 # For JAX, convert to sharded arrays; for PyTorch, return torch tensors
                 if self._sharding is not None:
                     yield jax.tree.map(lambda x: jax.make_array_from_process_local_data(self._sharding, x), batch)
@@ -589,6 +614,7 @@ class RLDSDataLoader:
                 )
                 batch["progress_target"] = progress_target
                 batch["episode_hash"] = episode_hash
+                batch = _drop_non_numeric_fields(batch)
                 yield jax.tree.map(lambda x: jax.make_array_from_process_local_data(self._sharding, x), batch)
 
 

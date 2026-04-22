@@ -84,6 +84,11 @@ class AlohaInputs(transforms.DataTransformFn):
         if "prompt" in data:
             inputs["prompt"] = data["prompt"]
 
+        # Preserve optional metadata used by progress supervision.
+        for key in ("frame_index", "episode_len", "episode_index"):
+            if key in data:
+                inputs[key] = data[key]
+
         return inputs
 
 
@@ -94,10 +99,11 @@ class AlohaOutputs(transforms.DataTransformFn):
     # If true, this will convert the joint and gripper values from the standard Aloha space to
     # the space used by the pi internal runtime which was used to train the base model.
     adapt_to_pi: bool = True
+    # Robot action DoF to pass to the environment (model may output more dims with padding).
+    action_dim: int = 14
 
     def __call__(self, data: dict) -> dict:
-        # Only return the first 14 dims.
-        actions = np.asarray(data["actions"][:, :14])
+        actions = np.asarray(data["actions"][:, : self.action_dim])
         return {"actions": _encode_actions(actions, adapt_to_pi=self.adapt_to_pi)}
 
 
