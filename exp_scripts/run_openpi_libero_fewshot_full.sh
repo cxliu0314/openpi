@@ -2,7 +2,7 @@
 set -euo pipefail
 
 if [ "$#" -lt 2 ]; then
-    echo "Usage: bash exp_scripts/run_openpi_libero_fewshot_full.sh <original|split_padded> <10|20|30|50|100>"
+    echo "Usage: bash exp_scripts/run_openpi_libero_fewshot_full.sh <original|split_padded> <5|10|20|30|50|100>"
     exit 2
 fi
 
@@ -15,7 +15,7 @@ case "$DATA_KIND" in
 esac
 
 case "$SHOT" in
-    10|20|30|50|100) ;;
+    5|10|20|30|50|100) ;;
     *) echo "Unknown SHOT: $SHOT"; exit 2 ;;
 esac
 
@@ -24,11 +24,11 @@ export HF_HOME="${HF_HOME:-/data/HF_Cache_dataevo}"
 export HF_LEROBOT_HOME="${HF_LEROBOT_HOME:-${HF_HOME}/lerobot}"
 UV_BIN="${UV_BIN:-${OPENPI_DIR}/.venv/bin/uv}"
 
-CONFIG_NAME="${CONFIG_NAME:-pi05_libero}"
-FEWSHOT_LEROBOT_PREFIX="${FEWSHOT_LEROBOT_PREFIX:-libero_fewshot_lerobot_trainval_2x}"
+CONFIG_NAME="${CONFIG_NAME:-pi05_rlds_libero_uni}"
+FEWSHOT_RLDS_ROOT="${FEWSHOT_RLDS_ROOT:-/data/Embobrain/dataset_revised/libero_fewshot_trainval_2x}"
 DATASET_NAME="${DATASET_NAME:-libero_10_no_noops}"
-TRAIN_REPO_ID="${TRAIN_REPO_ID:-${FEWSHOT_LEROBOT_PREFIX}/${DATA_KIND}_n${SHOT}_train/${DATASET_NAME}}"
-VAL_REPO_ID="${VAL_REPO_ID:-${FEWSHOT_LEROBOT_PREFIX}/${DATA_KIND}_n${SHOT}_val/${DATASET_NAME}}"
+RLDS_DATA_ROOT="${RLDS_DATA_ROOT:-${FEWSHOT_RLDS_ROOT}/${DATA_KIND}_n${SHOT}}"
+ASSET_REPO_ID="${ASSET_REPO_ID:-rlds_pi05_uni_libero_fewshot/${DATA_KIND}_n${SHOT}/${DATASET_NAME}}"
 EXP_SUFFIX="${EXP_SUFFIX:-}"
 EXP_NAME="${EXP_NAME:-pi05-full-${DATA_KIND}-n${SHOT}-fewshot${EXP_SUFFIX}}"
 PROJECT_NAME="${PROJECT_NAME:-fewshot_full_exp}"
@@ -103,20 +103,18 @@ if [ ! -x "$UV_BIN" ]; then
     exit 1
 fi
 
-for repo_id in "$TRAIN_REPO_ID" "$VAL_REPO_ID"; do
-    if [ ! -f "$HF_HOME/lerobot/$repo_id/meta/info.json" ]; then
-        echo "LeRobot dataset is not ready: $HF_HOME/lerobot/$repo_id/meta/info.json"
-        echo "Convert it first, for example:"
-        echo "  cd $OPENPI_DIR && $UV_BIN run scripts/convert_fewshot_rlds_to_lerobot.py --data-kind $DATA_KIND --shot $SHOT"
-        exit 1
-    fi
-done
+if [ ! -f "$RLDS_DATA_ROOT/$DATASET_NAME/1.0.0/dataset_info.json" ]; then
+    echo "RLDS dataset is not ready: $RLDS_DATA_ROOT/$DATASET_NAME/1.0.0/dataset_info.json"
+    exit 1
+fi
 
-NORM_STATS_DIR="$OPENPI_DIR/assets/$CONFIG_NAME/$TRAIN_REPO_ID"
+NORM_STATS_DIR="$OPENPI_DIR/assets/$CONFIG_NAME/$ASSET_REPO_ID"
 if [ "$RECOMPUTE_NORM_STATS" = "1" ] || [ ! -f "$NORM_STATS_DIR/norm_stats.json" ]; then
     "$UV_BIN" run scripts/compute_fewshot_norm_stats.py \
         --config-name "$CONFIG_NAME" \
-        --data-repo-id "$TRAIN_REPO_ID"
+        --data-repo-id "$ASSET_REPO_ID" \
+        --data-asset-id "$ASSET_REPO_ID" \
+        --data-rlds-dir "$RLDS_DATA_ROOT"
 fi
 
 "$UV_BIN" run scripts/train_fewshot.py "$CONFIG_NAME" \
@@ -125,8 +123,9 @@ fi
     --checkpoint-base-dir "$CHECKPOINT_BASE_DIR" \
     "${WANDB_ARGS[@]}" \
     "${TRAIN_FLAGS[@]}" \
-    --data.repo-id "$TRAIN_REPO_ID" \
-    --val-repo-id "$VAL_REPO_ID" \
+    --data.repo-id "$ASSET_REPO_ID" \
+    --data.assets.asset-id "$ASSET_REPO_ID" \
+    --data.rlds-data-dir "$RLDS_DATA_ROOT" \
     --num-train-steps "$TRAIN_STEPS" \
     --log-interval "$LOG_INTERVAL" \
     --batch-size "$BATCH_SIZE" \

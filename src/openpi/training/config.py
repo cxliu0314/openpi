@@ -10,6 +10,7 @@ from typing import Any, Literal, Protocol, TypeAlias
 
 import etils.epath as epath
 import flax.nnx as nnx
+import numpy as np
 from typing_extensions import override
 import tyro
 
@@ -23,10 +24,10 @@ import openpi.policies.libero_policy as libero_policy
 import openpi.shared.download as _download
 import openpi.shared.normalize as _normalize
 import openpi.training.droid_rlds_dataset as droid_rlds_dataset
-import openpi.training.rlds_pi05_dataset as rlds_pi05_dataset
 import openpi.training.misc.polaris_config as polaris_config
 import openpi.training.misc.roboarena_config as roboarena_config
 import openpi.training.optimizer as _optimizer
+import openpi.training.rlds_pi05_dataset as rlds_pi05_dataset
 import openpi.training.weight_loaders as weight_loaders
 import openpi.transforms as _transforms
 
@@ -345,6 +346,138 @@ class LeRobotFrankaDualDataConfig(DataConfigFactory):
 
 
 @dataclasses.dataclass(frozen=True)
+class RobotWinEndposeToLiberoDualEef(_transforms.DataTransformFn):
+    """Converts RobotWin dual-arm xyz+wxyz-quat+gripper endpose data to LIBERO-style eef tensors."""
+
+    pos_scale: float = 0.05
+    rot_scale: float = 0.5
+    gripper_qpos_scale: float = 0.04
+
+    def __call__(self, data: dict) -> dict:
+        data = dict(data)
+        state = np.asarray(data["state"], dtype=np.float32)
+        if state.shape[-1] != 16:
+            raise ValueError(f"RobotWin endpose state must be 16D, got shape {state.shape}")
+
+        data["state"] = self._state_to_libero_dual_eef(state)
+        if "actions" in data:
+            actions = np.asarray(data["actions"], dtype=np.float32)
+            if actions.shape[-1] != 16:
+                raise ValueError(f"RobotWin endpose actions must be 16D, got shape {actions.shape}")
+            data["actions"] = self._absolute_targets_to_libero_dual_delta_actions(state, actions)
+        return data
+
+    def _state_to_libero_dual_eef(self, state: np.ndarray) -> np.ndarray:
+        left = self._pose_to_libero_state(state[..., :8])
+        right = self._pose_to_libero_state(state[..., 8:16])
+        return np.concatenate((left, right), axis=-1).astype(np.float32)
+
+    def _absolute_targets_to_libero_dual_delta_actions(self, state: np.ndarray, targets: np.ndarray) -> np.ndarray:
+        if targets.ndim == 1:
+            current = state
+        else:
+            state_for_chunk = np.broadcast_to(state, targets[..., :1, :].shape[:-2] + (1, state.shape[-1]))
+            current = np.concatenate((state_for_chunk, targets[..., :-1, :]), axis=-2)
+
+        left = self._pose_targets_to_libero_action(current[..., :8], targets[..., :8])
+        right = self._pose_targets_to_libero_action(current[..., 8:16], targets[..., 8:16])
+        return np.concatenate((left, right), axis=-1).astype(np.float32)
+
+    def _pose_to_libero_state(self, pose: np.ndarray) -> np.ndarray:
+        xyz = pose[..., :3]
+        rotvec = self._quat_wxyz_to_rotvec(pose[..., 3:7])
+        gripper = self.gripper_qpos_scale * pose[..., 7:8]
+        gripper_qpos = np.concatenate((gripper, -gripper), axis=-1)
+        return np.concatenate((xyz, rotvec, gripper_qpos), axis=-1)
+
+    def _pose_targets_to_libero_action(self, current: np.ndarray, target: np.ndarray) -> np.ndarray:
+        delta_pos = (target[..., :3] - current[..., :3]) / self.pos_scale
+        delta_rot = self._relative_quat_wxyz_to_rotvec(current[..., 3:7], target[..., 3:7]) / self.rot_scale
+        delta_eef = np.clip(np.concatenate((delta_pos, delta_rot), axis=-1), -1.0, 1.0)
+
+        # RobotWin stores normalized gripper as 0=closed, 1=open. Match the
+        # LIBERO/DROID action convention used here: -1=open, +1=close.
+        gripper = 1.0 - 2.0 * target[..., 7:8]
+        gripper = np.clip(gripper, -1.0, 1.0)
+        return np.concatenate((delta_eef, gripper), axis=-1)
+
+    def _quat_wxyz_to_rotvec(self, quat_wxyz: np.ndarray) -> np.ndarray:
+        from scipy.spatial.transform import Rotation
+
+        quat_xyzw = self._quat_wxyz_to_xyzw(quat_wxyz)
+        flat_shape = quat_xyzw.shape[:-1]
+        return Rotation.from_quat(quat_xyzw.reshape(-1, 4)).as_rotvec().reshape(*flat_shape, 3).astype(np.float32)
+
+    def _relative_quat_wxyz_to_rotvec(self, current_quat_wxyz: np.ndarray, target_quat_wxyz: np.ndarray) -> np.ndarray:
+        from scipy.spatial.transform import Rotation
+
+        current_quat_xyzw = self._quat_wxyz_to_xyzw(current_quat_wxyz)
+        target_quat_xyzw = self._quat_wxyz_to_xyzw(target_quat_wxyz)
+        current = Rotation.from_quat(current_quat_xyzw.reshape(-1, 4))
+        target = Rotation.from_quat(target_quat_xyzw.reshape(-1, 4))
+        rotvec = (target * current.inv()).as_rotvec()
+        return rotvec.reshape(*target_quat_xyzw.shape[:-1], 3).astype(np.float32)
+
+    def _quat_wxyz_to_xyzw(self, quat_wxyz: np.ndarray) -> np.ndarray:
+        quat_wxyz = self._normalize_quat(quat_wxyz)
+        return np.concatenate((quat_wxyz[..., 1:4], quat_wxyz[..., 0:1]), axis=-1)
+
+    def _normalize_quat(self, quat_xyzw: np.ndarray) -> np.ndarray:
+        norm = np.linalg.norm(quat_xyzw, axis=-1, keepdims=True)
+        return quat_xyzw / np.maximum(norm, 1e-8)
+
+
+@dataclasses.dataclass(frozen=True)
+class LeRobotRobotWinEndposeDataConfig(DataConfigFactory):
+    """RobotWin dual-arm endpose layout converted to LIBERO/DROID-style eef state/actions."""
+
+    default_prompt: str | None = None
+    robot_action_dim: int = 14
+
+    repack_transforms: tyro.conf.Suppress[_transforms.Group] = dataclasses.field(
+        default=_transforms.Group(
+            inputs=[
+                _transforms.RepackTransform(
+                    {
+                        "images": {
+                            "cam_high": "observation.images.cam_high",
+                            "cam_left_wrist": "observation.images.cam_left_wrist",
+                            "cam_right_wrist": "observation.images.cam_right_wrist",
+                        },
+                        "state": "observation.state",
+                        "actions": "action",
+                        "prompt": "prompt",
+                        "frame_index": "frame_index",
+                        "episode_len": "episode_len",
+                    }
+                )
+            ]
+        )
+    )
+    action_sequence_keys: Sequence[str] = ("action",)
+
+    @override
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        data_transforms = _transforms.Group(
+            inputs=[
+                RobotWinEndposeToLiberoDualEef(),
+                aloha_policy.AlohaInputs(adapt_to_pi=False),
+            ],
+            outputs=[aloha_policy.AlohaOutputs(adapt_to_pi=False, action_dim=self.robot_action_dim)],
+        )
+        model_transforms = ModelTransformFactory(default_prompt=self.default_prompt)(model_config)
+
+        return dataclasses.replace(
+            self.create_base_config(assets_dirs, model_config),
+            repack_transforms=self.repack_transforms,
+            data_transforms=data_transforms,
+            model_transforms=model_transforms,
+            action_sequence_keys=self.action_sequence_keys,
+            use_quantile_norm=False,
+        )
+
+
+@dataclasses.dataclass(frozen=True)
 class LeRobotLiberoDataConfig(DataConfigFactory):
     """
     This config is used to configure transforms that are applied at various parts of the data pipeline.
@@ -609,6 +742,10 @@ class TrainConfig:
 
     # Optional path to a PyTorch checkpoint to load weights from.
     pytorch_weight_path: str | None = None
+    # Whether PyTorch checkpoint loading must match every model parameter.
+    pytorch_weight_load_strict: bool = True
+    # If true, PyTorch training freezes all weights except chunk progress heads.
+    pytorch_freeze_except_progress_head: bool = False
 
     # Precision for PyTorch training.
     pytorch_training_precision: Literal["bfloat16", "float32"] = "bfloat16"
@@ -663,7 +800,7 @@ class TrainConfig:
     progress_readout_mode: Literal["chunk_prefix"] = "chunk_prefix"
 
     # Validation options.
-    use_val_set: bool = True
+    use_val_set: bool = False
     val_split_ratio: float = 0.1
     val_interval: int = 500
     val_num_batches: int = 10
@@ -910,14 +1047,12 @@ _CONFIGS = [
         ema_decay=None,
     ),
     TrainConfig(
-        name="pi05_franka_full_base",
-        model=pi0_config.Pi0Config(pi05=True, action_dim=32, action_horizon=10, discrete_state_input=False),
-        data=LeRobotFrankaDualDataConfig(
-            repo_id="robotwin_9tasks_0331_split",
+        name="pi05_robotwin_endpose_full_base",
+        model=pi0_config.Pi0Config(pi05=True, action_dim=32),
+        data=LeRobotRobotWinEndposeDataConfig(
+            repo_id="robotwin_9tasks_0331_split_endpose",
             base_config=DataConfig(prompt_from_task=True),
-            robot_action_dim=8,
         ),
-        batch_size=256,
         lr_schedule=_optimizer.CosineDecaySchedule(
             warmup_steps=10_000,
             peak_lr=5e-5,
@@ -928,6 +1063,28 @@ _CONFIGS = [
         ema_decay=0.999,
         weight_loader=weight_loaders.CheckpointWeightLoader("/data/Embobrain/modelsrepo/pi05_base/params"),
         num_train_steps=30_000,
+        batch_size=32,
+        fsdp_devices=1,
+    ),
+    TrainConfig(
+        name="pi05_franka_full_base",
+        model=pi0_config.Pi0Config(pi05=True, action_dim=32),
+        data=LeRobotFrankaDualDataConfig(
+            repo_id="robotwin_9tasks_0331_split",
+            base_config=DataConfig(prompt_from_task=True),
+        ),
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=10_000,
+            peak_lr=5e-5,
+            decay_steps=1_000_000,
+            decay_lr=5e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        weight_loader=weight_loaders.CheckpointWeightLoader("/data/Embobrain/modelsrepo/pi05_base/params"),
+        num_train_steps=30_000,
+        batch_size=32,
+        fsdp_devices=1,
     ),
     TrainConfig(
         name="pi05_libero",
@@ -1051,6 +1208,41 @@ _CONFIGS = [
         optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
         ema_decay=0.999,
         weight_loader=weight_loaders.CheckpointWeightLoader("/data/Embobrain/modelsrepo/pi05_base/params"),
+        num_train_steps=30_000,
+    ),
+    TrainConfig(
+        name="pi05_rlds_modified_libero_uni_no_progress",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=10,
+            discrete_state_input=False,
+            enable_progress_head=False,
+        ),
+        data=RLDSPi05LiberoStyleDataConfig(
+            repo_id="rlds_pi05_uni_modified_libero_10_no_noops",
+            assets=AssetsConfig(asset_id="rlds_pi05_uni_modified_libero_10_no_noops"),
+            rlds_data_dir="/data/Embobrain/dataset_revised/modified_libero_rlds",
+            adapter_kind=rlds_pi05_dataset.Pi05RLDSAdapterKind.LIBERO,
+            datasets=(
+                rlds_pi05_dataset.RLDSDatasetSpec(
+                    name="libero_10_no_noops",
+                    version="1.0.0",
+                    weight=1.0,
+                ),
+            ),
+        ),
+        batch_size=256,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=10_000,
+            peak_lr=5e-5,
+            decay_steps=1_000_000,
+            decay_lr=5e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        weight_loader=weight_loaders.CheckpointWeightLoader("/data/Embobrain/modelsrepo/pi05_base/params"),
+        enable_progress_loss=False,
+        use_val_set=False,
         num_train_steps=30_000,
     ),
     TrainConfig(

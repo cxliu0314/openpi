@@ -11,24 +11,20 @@ if [ "$#" -eq 3 ]; then
   export CUDA_VISIBLE_DEVICES="$3"
 elif [ "$#" -eq 0 ]; then
   CONFIG_NAME="${CONFIG_NAME:-pi05_robotwin_endpose_full_base}"
-  EXP_NAME="${EXP_NAME:-pi05_robotwin_full_chunk_progress_0427_endpose}"
+  EXP_NAME="${EXP_NAME:-pi05_robotwin_baseline_0427_endpose}"
   export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}"
 else
   echo "usage: bash $0 [<train_config_name> <model_name> <gpu_use>]"
-  echo "example: bash $0 pi05_robotwin_endpose_full_base demo_clean_split_progress 0,1,2,3,4,5,6,7"
+  echo "example: bash $0 pi05_robotwin_endpose_full_base demo_clean_dual_baseline 0,1,2,3,4,5,6,7"
   exit 1
 fi
 
-ROBOTWIN_LEROBOT_REPO_ID="${ROBOTWIN_LEROBOT_REPO_ID:-robotwin_9tasks_0331_split_endpose}"
-ROBOTWIN_LEROBOT_LOCAL_DIR="${ROBOTWIN_LEROBOT_LOCAL_DIR:-/data/Embobrain/RoboTwin/.cache/lerobot/robotwin_9tasks_0331_split_endpose}"
+ROBOTWIN_LEROBOT_REPO_ID="${ROBOTWIN_LEROBOT_REPO_ID:-robotwin_9tasks_0331_dual_endpose}"
+ROBOTWIN_LEROBOT_LOCAL_DIR="${ROBOTWIN_LEROBOT_LOCAL_DIR:-/data/Embobrain/RoboTwin/.cache/lerobot/robotwin_9tasks_0331_dual_endpose}"
 ROBOTWIN_NORM_STATS_DIR="$OPENPI_DIR/assets/$CONFIG_NAME/${ROBOTWIN_LEROBOT_REPO_ID}"
 ROBOTWIN_LEROBOT_ROOT="$(dirname "$ROBOTWIN_LEROBOT_LOCAL_DIR")"
 ROBOTWIN_ENDPOSE_QUAT_ORDER="wxyz"
 ROBOTWIN_NORM_STATS_QUAT_ORDER_FILE="$ROBOTWIN_NORM_STATS_DIR/robotwin_endpose_quat_order.txt"
-
-PROGRESS_TARGET_MODE="chunk"
-PROGRESS_READOUT_MODE="chunk_prefix"
-PROGRESS_LOSS_WEIGHT="${PROGRESS_LOSS_WEIGHT:-0.1}"
 
 # Set these to 1 only when you intentionally want to rebuild cached artifacts.
 RECOMPUTE_NORM_STATS="${RECOMPUTE_NORM_STATS:-0}"
@@ -105,7 +101,7 @@ VAL_NUM_BATCHES="${CONFIG_INFO[10]}"
 VAL_SPLIT_RATIO="${CONFIG_INFO[11]}"
 
 echo "============================================"
-echo "  OpenPI pi0.5 RobotWin full finetune + chunk progress"
+echo "  OpenPI pi0.5 RobotWin baseline full finetune"
 echo "============================================"
 echo "OpenPI dir:              $OPENPI_DIR"
 echo "Config:                  $CONFIG_NAME"
@@ -119,9 +115,6 @@ echo "LeRobot repo id:         $ROBOTWIN_LEROBOT_REPO_ID"
 echo "LeRobot local dir:       $ROBOTWIN_LEROBOT_LOCAL_DIR"
 echo "Norm stats dir:          $ROBOTWIN_NORM_STATS_DIR"
 echo "Endpose quat order:      $ROBOTWIN_ENDPOSE_QUAT_ORDER"
-echo "Progress target mode:    $PROGRESS_TARGET_MODE"
-echo "Progress readout mode:   $PROGRESS_READOUT_MODE"
-echo "Progress loss weight:    $PROGRESS_LOSS_WEIGHT"
 echo "Use val set(config):     $USE_VAL_SET"
 echo "Validation split(config): $VAL_SPLIT_RATIO"
 echo "Validation interval(config): $VAL_INTERVAL"
@@ -364,18 +357,13 @@ else
   TRAIN_FLAGS+=(--no-wandb-enabled)
 fi
 
-echo "========== Train RobotWin full finetune + chunk-prefix progress =========="
+echo "========== Train RobotWin baseline full finetune =========="
 "$UV_BIN" run scripts/train.py "$CONFIG_NAME" \
   --exp-name="$EXP_NAME" \
   "${TRAIN_FLAGS[@]}" \
-  --data.repo-id="$ROBOTWIN_LEROBOT_REPO_ID" \
-  --model.enable-progress-head True \
-  --enable-progress-loss \
-  --progress-target-mode="$PROGRESS_TARGET_MODE" \
-  --progress-readout-mode="$PROGRESS_READOUT_MODE" \
-  --progress-loss-weight="$PROGRESS_LOSS_WEIGHT"
+  --data.repo-id="$ROBOTWIN_LEROBOT_REPO_ID"
 
 echo ""
 echo "============================================"
-echo "  pi0.5 full finetune + chunk progress done"
+echo "  pi0.5 baseline full finetune done"
 echo "============================================"

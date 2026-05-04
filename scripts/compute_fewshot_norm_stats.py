@@ -87,10 +87,26 @@ def create_rlds_dataloader(
     return data_loader, num_batches
 
 
-def main(config_name: str, max_frames: int | None = None, data_repo_id: str | None = None):
+def main(
+    config_name: str,
+    max_frames: int | None = None,
+    data_repo_id: str | None = None,
+    data_rlds_dir: str | None = None,
+    data_asset_id: str | None = None,
+):
     config = _config.get_config(config_name)
     if data_repo_id is not None:
         config = dataclasses.replace(config, data=dataclasses.replace(config.data, repo_id=data_repo_id))
+    if data_rlds_dir is not None:
+        config = dataclasses.replace(config, data=dataclasses.replace(config.data, rlds_data_dir=data_rlds_dir))
+    if data_asset_id is not None:
+        config = dataclasses.replace(
+            config,
+            data=dataclasses.replace(
+                config.data,
+                assets=dataclasses.replace(config.data.assets, asset_id=data_asset_id),
+            ),
+        )
     data_config = config.data.create(config.assets_dirs, config.model)
 
     if data_config.rlds_data_dir is not None:

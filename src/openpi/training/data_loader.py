@@ -427,15 +427,18 @@ def create_rlds_data_loader(
             number of batches in the dataset, the data loader will loop over the dataset.
             If not provided, will iterate over the dataset indefinitely.
     """
-    if framework == "pytorch":
-        raise NotImplementedError("PyTorch RLDS data loader is not supported yet")
-    dataset = create_rlds_dataset(data_config, action_horizon, batch_size, shuffle=shuffle)
+    if framework == "pytorch" and torch.distributed.is_initialized():
+        local_batch_size = batch_size // torch.distributed.get_world_size()
+    else:
+        local_batch_size = batch_size
+    dataset = create_rlds_dataset(data_config, action_horizon, local_batch_size, shuffle=shuffle)
     dataset = transform_iterable_dataset(dataset, data_config, skip_norm_stats=skip_norm_stats, is_batched=True)
 
     data_loader = RLDSDataLoader(
         dataset,
-        sharding=sharding,
+        sharding=None if framework == "pytorch" else sharding,
         num_batches=num_batches,
+        framework=framework,
         require_accurate_progress=require_accurate_progress,
         progress_target_mode=progress_target_mode,
     )
@@ -573,6 +576,7 @@ class RLDSDataLoader:
         *,
         sharding: jax.sharding.Sharding | None = None,
         num_batches: int | None = None,
+        framework: str = "jax",
         require_accurate_progress: bool = False,
         progress_target_mode: Literal["chunk"] = "chunk",
     ):
@@ -582,7 +586,7 @@ class RLDSDataLoader:
         if jax.process_count() > 1:
             raise NotImplementedError("Data loading with multiple processes is not supported.")
 
-        if sharding is None:
+        if sharding is None and framework == "jax":
             # Use data parallel sharding by default.
             sharding = jax.sharding.NamedSharding(
                 jax.sharding.Mesh(jax.devices(), ("B",)),
@@ -590,6 +594,7 @@ class RLDSDataLoader:
             )
 
         self._sharding = sharding
+        self._framework = framework
         self._num_batches = num_batches
         self._require_accurate_progress = require_accurate_progress
         self._progress_target_mode = progress_target_mode
@@ -615,7 +620,10 @@ class RLDSDataLoader:
                 batch["progress_target"] = progress_target
                 batch["episode_hash"] = episode_hash
                 batch = _drop_non_numeric_fields(batch)
-                yield jax.tree.map(lambda x: jax.make_array_from_process_local_data(self._sharding, x), batch)
+                if self._sharding is not None:
+                    yield jax.tree.map(lambda x: jax.make_array_from_process_local_data(self._sharding, x), batch)
+                else:
+                    yield jax.tree.map(torch.as_tensor, batch)
 
 
 class DataLoaderImpl(DataLoader):
